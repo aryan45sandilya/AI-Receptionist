@@ -1,0 +1,35 @@
+[project]
+name = "ai-receptionist"
+version = "0.1.0"
+description = "Voice + WhatsApp AI receptionist for small businesses"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "sqlalchemy[asyncio]>=2.0",
+    "alembic",
+    "psycopg[binary]>=3.2",
+    "pydantic>=2",
+    "pydantic-settings>=2",
+    "openai>=2",
+    "python-dotenv",
+    "tzdata",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+# One event loop for the whole session, so the database engine can be shared.
+# With a per-test loop, every test rebuilt the engine and paid a fresh TCP + TLS
+# + auth handshake to a remote Postgres -- about 20 seconds per test against a
+# distant region. The concurrency tests are unaffected: they create their own
+# sessions from the shared engine, and those still run on one loop.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+markers = [
+    "db: test needs a live Postgres (set DATABASE_URL)",
+]
