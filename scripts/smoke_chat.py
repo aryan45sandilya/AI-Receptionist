@@ -18,13 +18,12 @@ from zoneinfo import ZoneInfo
 from openai import AsyncOpenAI
 from sqlalchemy import select
 
-from backend.app.agent.loop import AgentRunner
-from backend.app.agent.prompts import build_system_prompt
+from backend.app.agent.loop import build_runner
 from backend.app.agent.session import AgentSession
 from backend.app.agent.tools import ToolContext
 from backend.app.config import get_settings
 from backend.app.db import dispose_engine, get_session_factory
-from backend.app.domain import availability, calls as call_log
+from backend.app.domain import calls as call_log
 from backend.app.enums import BookingSource, CallChannel, CallStatus, TurnRole
 from backend.app.models import Booking, Business
 from backend.app.runtime import run_async
@@ -64,7 +63,6 @@ async def run(scenario: str) -> None:
             raise SystemExit("No business seeded. Run: python -m scripts.seed_demo")
 
         tz = ZoneInfo(business.timezone)
-        services = await availability.list_services(db, business.id)
         call = await call_log.start_call(
             db, business_id=business.id, channel=CallChannel.TERMINAL,
             from_phone_e164="+919876543210",
@@ -76,13 +74,10 @@ async def run(scenario: str) -> None:
             caller_phone="+919876543210", call_id=call.id,
         )
         ctx = ToolContext(
-            db=db, session=agent_session, business=business, settings=settings,
+            db=db, session=agent_session, settings=settings,
             now=datetime.now(UTC), source=BookingSource.VOICE,
         )
-        runner = AgentRunner(
-            client=client, settings=settings, ctx=ctx,
-            system_prompt=build_system_prompt(business, sorted(services, key=lambda s: s.name)),
-        )
+        runner = await build_runner(client=client, settings=settings, ctx=ctx)
 
         print(f"\n  scenario: {scenario}   model: {settings.llm_model}")
         print(f"  local time: {datetime.now(tz).strftime('%A %d %B %Y, %I:%M %p')}\n")

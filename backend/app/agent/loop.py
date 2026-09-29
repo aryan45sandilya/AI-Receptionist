@@ -27,12 +27,22 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from ..config import Settings
-from .prompts import current_time_note
+from .prompts import build_system_prompt, current_time_note
+from .session import HandoffRequest
 from .tools import ToolContext, execute_tool, tool_schemas
 
 # A booking conversation needs a handful of tool calls per turn at most. This cap
 # stops a pathological loop, it is not a real working limit.
 MAX_TOOL_ITERATIONS = 8
+
+# A reasoning model at low effort now and then spends its whole budget thinking
+# and returns neither words nor a tool call. Asking once more almost always
+# produces an answer; asking a third time rarely does, and the caller is waiting.
+MAX_EMPTY_RETRIES = 1
+EMPTY_REPLY_NUDGE = (
+    "You have not replied yet. Answer the caller now, in one or two short spoken "
+    "sentences, or call the tool that is needed."
+)
 
 
 @dataclass
@@ -90,7 +100,20 @@ class AgentRunner:
     def messages(self) -> list[dict[str, Any]]:
         return self._messages
 
-    def _request_messages(self, now: datetime) -> list[dict[str, Any]]:
+    def _hand_off(self, why: str) -> None:
+        """Record that the agent is giving the call up, if nothing else has.
+
+        The loop returns ``handoff=True`` when it cannot continue (a failed
+        request, a model that will not settle). Recording it in the session as
+        well is what makes the stored call say so: without it the call is filed
+        as completed, with no reason, and the owner reading the dashboard cannot
+        tell a finished booking from a call the agent dropped.
+        """
+        session = self._ctx.session
+        if session.handoff is None:
+            session.handoff = HandoffRequest(reason="agent_cannot_proceed", summary=why)
+
+    def _request_messages(self, now: datetime, nudge: str | None = None) -> list[dict[str, Any]]:
         """History with a freshly-timestamped system message in front.
 
         The clock lives here rather than inside the stored history so that the
@@ -100,7 +123,11 @@ class AgentRunner:
         """
         clock = now.astimezone(self._ctx.session.tz).strftime("%A %d %B %Y, %I:%M %p")
         system = f"{self._system_prompt}\n\n{current_time_note(clock)}"
-        return [{"role": "system", "content": system}, *self._messages]
+        messages = [{"role": "system", "content": system}, *self._messages]
+        if nudge:
+            # For this request only: never stored, so it cannot pile up in history.
+            messages.append({"role": "system", "content": nudge})
+        return messages
 
     async def run_turn(
         self,
@@ -124,6 +151,7 @@ class AgentRunner:
         # turning one transient failure into a dead conversation.
         history_mark = len(self._messages)
         self._messages.append({"role": "user", "content": user_text})
+        self._ctx.session.note_caller_speech(user_text)
 
         # Owned here rather than in _drive so the error path can still report
         # which tools ran before the turn fell over.
@@ -146,6 +174,7 @@ class AgentRunner:
             # was rejected -- and this lands in call_turns.text for the
             # dashboard, where a class name on its own explains nothing.
             detail = str(exc).strip().replace("\n", " ")[:300]
+            self._hand_off(f"The assistant failed mid-turn: {type(exc).__name__}.")
             return TurnResult(
                 text="Sorry, I lost that for a moment. Let me put you through to a colleague.",
                 metrics=_finish(metrics, anchor),
@@ -167,6 +196,8 @@ class AgentRunner:
     ) -> TurnResult:
         """The tool-use loop. Split out so ``run_turn`` owns the history rewind."""
         finish_reason: str | None = None
+        empty_retries = 0
+        nudge: str | None = None
 
         for _ in range(MAX_TOOL_ITERATIONS):
             first_token_at: float | None = None
@@ -176,18 +207,23 @@ class AgentRunner:
             # They have to be reassembled before anything can be parsed.
             partial_calls: dict[int, dict[str, Any]] = {}
 
-            stream = await self._client.chat.completions.create(
-                model=self._settings.llm_model,
-                messages=self._request_messages(now),
-                tools=self._tools,
-                tool_choice="auto",
-                max_tokens=self._settings.llm_max_tokens,
-                temperature=self._settings.llm_temperature,
-                stream=True,
+            request: dict[str, Any] = {
+                "model": self._settings.llm_model,
+                "messages": self._request_messages(now, nudge),
+                "tools": self._tools,
+                "tool_choice": "auto",
+                "max_tokens": self._settings.llm_max_tokens,
+                "temperature": self._settings.llm_temperature,
+                "stream": True,
                 # Usage is omitted from streamed responses unless asked for, and
                 # without it the Phase 7 cost-per-call estimate has no inputs.
-                stream_options={"include_usage": True},
-            )
+                "stream_options": {"include_usage": True},
+            }
+            if self._settings.llm_reasoning_effort:
+                # A reasoning model spends hidden tokens before its first word.
+                # Low effort is what keeps that under a natural pause.
+                request["reasoning_effort"] = self._settings.llm_reasoning_effort
+            stream = await self._client.chat.completions.create(**request)
 
             async for chunk in stream:
                 if chunk.usage is not None:
@@ -231,9 +267,15 @@ class AgentRunner:
 
             assistant_text = "".join(text_parts)
             if not partial_calls:
-                if assistant_text:
+                if assistant_text.strip():
                     self._messages.append({"role": "assistant", "content": assistant_text})
+                    break
+                if empty_retries < MAX_EMPTY_RETRIES:
+                    empty_retries += 1
+                    nudge = EMPTY_REPLY_NUDGE
+                    continue
                 break
+            nudge = None
 
             # The assistant turn that requested the tools has to go into history
             # before the results, or the tool_call_ids reference nothing.
@@ -259,7 +301,17 @@ class AgentRunner:
                 self._messages.append(
                     {"role": "tool", "tool_call_id": call["id"], "content": output}
                 )
+
+            # Text from the next model call continues this reply. Without a
+            # separator "Let me check.We have..." runs together, which reads
+            # badly and, more to the point, hides the sentence boundary from
+            # anything cutting the stream into speech.
+            if collected_text and not collected_text[-1].endswith((" ", "\n")):
+                collected_text.append(" ")
+                if on_text is not None:
+                    on_text(" ")
         else:
+            self._hand_off("The assistant could not settle on a reply and gave up.")
             return TurnResult(
                 text="I am having trouble with that. Let me put you through to a colleague.",
                 metrics=_finish(metrics, anchor),
@@ -330,3 +382,23 @@ def _finish(metrics: TurnMetrics, anchor: float) -> TurnMetrics:
     # is measured to first audio out, which is what the caller actually waits for.
     metrics.total_ms = _ms(anchor, time.perf_counter())
     return metrics
+
+
+async def build_runner(*, client: AsyncOpenAI, settings: Settings, ctx: ToolContext) -> AgentRunner:
+    """An agent for this conversation, its prompt built from the call's snapshot.
+
+    The one place that turns a tool context into a running agent, so the
+    terminal demo, the smoke script and the voice socket cannot drift apart.
+    Loads the snapshot if it is not already there, which is why it is async.
+    """
+    snapshot = await ctx.get_snapshot()
+    return AgentRunner(
+        client=client,
+        settings=settings,
+        ctx=ctx,
+        # Sorted by name: the system prompt should be identical run to run, and
+        # an unstable service order would make it differ for no reason.
+        system_prompt=build_system_prompt(
+            snapshot.business, sorted(snapshot.services, key=lambda service: service.name)
+        ),
+    )

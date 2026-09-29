@@ -51,6 +51,17 @@ def use_utf8_console() -> None:
             reconfigure(encoding="utf-8", errors="replace")
 
 
+def selector_loop_factory() -> asyncio.AbstractEventLoop:
+    """A zero-argument loop factory, in the shape uvicorn's ``loop`` option takes.
+
+    uvicorn's own default on Windows is the Proactor loop, which psycopg cannot
+    use -- so the server has to be told, explicitly, to build a selector loop.
+    A custom import string is used as the factory as-is, which is why this takes
+    no arguments and always returns a selector loop, on every platform.
+    """
+    return asyncio.SelectorEventLoop()
+
+
 def run_async(coro: Coroutine[Any, Any, T]) -> T:
     """``asyncio.run``, on an event loop psycopg can actually use."""
     use_utf8_console()

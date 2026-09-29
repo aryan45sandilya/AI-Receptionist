@@ -105,6 +105,19 @@ class VoiceActivityDetector:
     _quiet_run: int = field(default=0, init=False)
     _in_speech: bool = field(default=False, init=False)
     _noise_floor: float | None = field(default=None, init=False)
+    _endpoint_silence_ms: int = field(default=0, init=False)
+
+    @property
+    def endpoint_silence_ms(self) -> int:
+        """Silence the last utterance waited through before it was closed.
+
+        The caller stopped talking this long before the detector could say so,
+        and they experience that wait as part of the reply latency. The turn
+        timer anchors on the moment they actually stopped, so it has to know.
+        Zero when the utterance was closed by the length cap rather than by
+        silence.
+        """
+        return self._endpoint_silence_ms
 
     @property
     def in_speech(self) -> bool:
@@ -209,6 +222,7 @@ class VoiceActivityDetector:
         # Drop the trailing silence that ended the utterance; there is no point
         # paying to transcribe it, and it adds latency.
         tail = self._quiet_run * FRAME_BYTES
+        self._endpoint_silence_ms = self._quiet_run * FRAME_MS
         audio = bytes(self._speech[: len(self._speech) - tail] if tail else self._speech)
 
         self._in_speech = False

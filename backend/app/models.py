@@ -263,8 +263,12 @@ class CallTurn(Base):
     llm_first_token_ms: Mapped[int | None] = mapped_column(Integer)
     llm_done_ms: Mapped[int | None] = mapped_column(Integer)
     tts_first_audio_ms: Mapped[int | None] = mapped_column(Integer)
-    # Anchor to first audio the caller actually hears: the only latency number
-    # that reflects what the call felt like.
+    # What the caller waited. On a voice channel that is anchor -> first audio
+    # they hear: the only latency number that reflects what the call felt like,
+    # and NULL when nothing was ever heard (a turn whose voice failed had no
+    # response time, not a small one). On a text channel there is no audio, so it
+    # is anchor -> reply complete. The two are not comparable: filter by
+    # calls.channel before taking percentiles.
     total_ms: Mapped[int | None] = mapped_column(Integer)
 
     barge_in: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

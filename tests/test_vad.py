@@ -13,6 +13,7 @@ import math
 
 import pytest
 
+from tests.audio_helpers import hiss, silence, tone
 from backend.app.voice.vad import (
     FRAME_BYTES,
     FRAME_MS,
@@ -22,30 +23,6 @@ from backend.app.voice.vad import (
     VoiceActivityDetector,
     frame_rms,
 )
-
-
-def tone(ms: int, amplitude: float = 0.3, hz: int = 220) -> bytes:
-    """A sine wave: stands in for speech."""
-    n = SAMPLE_RATE * ms // 1000
-    samples = array.array(
-        "h",
-        (int(amplitude * 32767 * math.sin(2 * math.pi * hz * i / SAMPLE_RATE)) for i in range(n)),
-    )
-    return samples.tobytes()
-
-
-def silence(ms: int) -> bytes:
-    return b"\x00\x00" * (SAMPLE_RATE * ms // 1000)
-
-
-def hiss(ms: int, amplitude: float = 0.004) -> bytes:
-    """Low-level room tone: loud enough to be present, quiet enough not to be speech."""
-    n = SAMPLE_RATE * ms // 1000
-    # Deterministic pseudo-noise, so a failure is always reproducible.
-    samples = array.array(
-        "h", (int(amplitude * 32767 * math.sin(i * 12.9898)) for i in range(n))
-    )
-    return samples.tobytes()
 
 
 def events_of(detector: VoiceActivityDetector, pcm: bytes) -> list[Event]:

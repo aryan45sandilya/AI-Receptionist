@@ -376,3 +376,64 @@ def test_multi_day_window_spans_days():
     assert len(days) == 3
     assert all(s.start < s.end for s in slots)
     assert all(s.end - s.start == timedelta(minutes=30) for s in slots)
+
+
+# --------------------------------------------------------------------------
+# Offering genuinely different choices
+# --------------------------------------------------------------------------
+
+from backend.app.domain.timeslots import spread  # noqa: E402
+
+
+def slots_at(*times: time, resource: UUID = DOCTOR) -> list[Slot]:
+    return [
+        Slot(
+            resource_id=resource,
+            start=datetime.combine(MONDAY, t, tzinfo=IST),
+            end=datetime.combine(MONDAY, t, tzinfo=IST) + timedelta(minutes=30),
+        )
+        for t in times
+    ]
+
+
+def test_spread_drops_near_duplicates():
+    """5:00, 5:15 and 5:30 are not three choices for a 30-minute service."""
+    ranked = slots_at(time(17, 0), time(17, 15), time(17, 30), time(17, 45), time(18, 0))
+    picked = spread(ranked, min_gap=timedelta(minutes=30), limit=3)
+    assert local_times(picked) == [time(17, 0), time(17, 30), time(18, 0)]
+
+
+def test_spread_keeps_the_order_it_was_given():
+    """Ranking is the caller's preference (soonest, or closest to what they
+    asked for). Spreading may drop entries but must never reshuffle them."""
+    ranked = slots_at(time(18, 30), time(18, 0), time(19, 0), time(18, 15))
+    assert local_times(spread(ranked, min_gap=timedelta(minutes=30), limit=3)) == [
+        time(18, 30), time(18, 0), time(19, 0),
+    ]
+
+
+def test_spread_respects_the_limit():
+    ranked = slots_at(time(9, 0), time(10, 0), time(11, 0), time(12, 0))
+    assert len(spread(ranked, min_gap=timedelta(minutes=30), limit=2)) == 2
+
+
+def test_spread_returns_fewer_when_there_are_not_enough_distinct_times():
+    ranked = slots_at(time(17, 0), time(17, 15))
+    assert local_times(spread(ranked, min_gap=timedelta(minutes=30), limit=3)) == [time(17, 0)]
+
+
+def test_a_gap_of_exactly_the_minimum_is_allowed():
+    """Back to back is fine: 5:00-5:30 and 5:30-6:00 do not overlap."""
+    ranked = slots_at(time(17, 0), time(17, 30))
+    assert len(spread(ranked, min_gap=timedelta(minutes=30), limit=2)) == 2
+
+
+def test_spread_compares_start_times_across_staff():
+    """The caller hears times, not people: two doctors free at 5:00 and 5:15 are
+    still two near-identical offers."""
+    ranked = slots_at(time(17, 0), resource=DOCTOR) + slots_at(time(17, 15), resource=HYGIENIST)
+    assert len(spread(ranked, min_gap=timedelta(minutes=30), limit=3)) == 1
+
+
+def test_spread_of_nothing_is_nothing():
+    assert spread([], min_gap=timedelta(minutes=30), limit=3) == []

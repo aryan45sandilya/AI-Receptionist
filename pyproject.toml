@@ -12,12 +12,13 @@ dependencies = [
     "pydantic>=2",
     "pydantic-settings>=2",
     "openai>=2",
+    "websockets",
     "python-dotenv",
     "tzdata",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio"]
+dev = ["pytest", "pytest-asyncio", "pytest-timeout"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -30,6 +31,10 @@ asyncio_mode = "auto"
 # sessions from the shared engine, and those still run on one loop.
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
+# A hung test should fail, not stall the run. Generous, because the database
+# tests talk to a remote Postgres. "thread" because Windows has no SIGALRM.
+timeout = 300
+timeout_method = "thread"
 markers = [
     "db: test needs a live Postgres (set DATABASE_URL)",
 ]

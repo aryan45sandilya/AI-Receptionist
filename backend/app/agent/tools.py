@@ -25,16 +25,15 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
 from ..domain import availability, booking as booking_domain
 from ..domain.datetime_parse import parse_when
+from ..domain.timeslots import spread
 from ..enums import BookingSource
-from ..models import Business, Staff
 from .session import AgentSession, HandoffRequest
 
 # Reasons a call may legitimately leave the agent. Kept as an enum in the schema
@@ -57,10 +56,23 @@ class ToolContext:
 
     db: AsyncSession
     session: AgentSession
-    business: Business
     settings: Settings
     now: datetime
     source: BookingSource
+    # Slow-changing facts about the business (services, staff, opening hours),
+    # read once per conversation. See domain/availability.py for why.
+    snapshot: availability.Snapshot | None = None
+
+    async def get_snapshot(self) -> availability.Snapshot:
+        """The call's snapshot, loading it on first use.
+
+        A voice call loads it up front, while the greeting is playing, so the
+        caller never waits for it. Anything that does not (a test, the terminal
+        demo) still works: the first tool call pays for it instead.
+        """
+        if self.snapshot is None:
+            self.snapshot = await availability.load_snapshot(self.db, self.session.business_id)
+        return self.snapshot
 
 
 def _tool_definitions() -> list[dict]:
@@ -325,16 +337,14 @@ def _phone(args: dict, ctx: ToolContext) -> str:
 
 async def _check_availability(args: dict, ctx: ToolContext) -> str:
     session = ctx.session
-    tz = session.tz
+    snapshot = await ctx.get_snapshot()
+    tz = snapshot.business.tz
     now_local = ctx.now.astimezone(tz)
 
-    services = await availability.resolve_service(
-        ctx.db, business_id=session.business_id, name=args["service"]
-    )
+    services = snapshot.find_services(args["service"])
     if not services:
-        offered = await availability.list_services(ctx.db, session.business_id)
         session.record_failure()
-        names = ", ".join(s.name for s in offered) or "none configured"
+        names = ", ".join(s.name for s in snapshot.services) or "none configured"
         return (
             f"No service matching {args['service']!r}. This business offers: {names}. "
             "Ask the caller which of these they want; do not invent a service."
@@ -350,9 +360,7 @@ async def _check_availability(args: dict, ctx: ToolContext) -> str:
     staff_id = None
     staff_name = None
     if args.get("staff_name"):
-        matches = await availability.resolve_staff(
-            ctx.db, business_id=session.business_id, name=args["staff_name"]
-        )
+        matches = snapshot.find_staff(args["staff_name"])
         if not matches:
             session.record_failure()
             return (
@@ -377,8 +385,8 @@ async def _check_availability(args: dict, ctx: ToolContext) -> str:
 
     slots = await availability.find_free_slots(
         ctx.db,
-        business=ctx.business,
-        service=service,
+        snapshot=snapshot,
+        duration_min=service.duration_min,
         window=window,
         now=ctx.now,
         staff_id=staff_id,
@@ -387,7 +395,11 @@ async def _check_availability(args: dict, ctx: ToolContext) -> str:
     )
     if staff_id is None:
         slots = availability.collapse_by_time(slots)
-    slots = slots[: ctx.settings.max_slots_offered]
+    slots = spread(
+        slots,
+        min_gap=timedelta(minutes=service.duration_min),
+        limit=ctx.settings.max_slots_offered,
+    )
 
     if not slots:
         session.record_failure()
@@ -402,7 +414,7 @@ async def _check_availability(args: dict, ctx: ToolContext) -> str:
         slots,
         service_id=service.id,
         service_name=service.name,
-        staff_lookup=await _staff_names(ctx),
+        staff_lookup=snapshot.staff_names(),
     )
     session.record_success()
 
@@ -413,22 +425,10 @@ async def _check_availability(args: dict, ctx: ToolContext) -> str:
         with_whom = f" with {slot.staff_name}" if slot.staff_name else ""
         lines.append(f"  [{slot.slot_id}] {slot.label}{with_whom}")
     lines.append(
-        "Offer these to the caller using this exact wording. To book, call "
-        "book_appointment with the slot_id in brackets."
+        "Offer at most the first two, in one short sentence, using this exact wording "
+        "for each time. To book, call book_appointment with the slot_id in brackets."
     )
     return "\n".join(lines)
-
-
-async def _staff_names(ctx: ToolContext) -> dict[uuid.UUID, str]:
-    """Resource id -> staff name, for labelling offered slots.
-
-    A resource id missing from this map is the business itself, which is how
-    "with whoever is free" is represented.
-    """
-    result = await ctx.db.execute(
-        select(Staff).where(Staff.business_id == ctx.session.business_id, Staff.active.is_(True))
-    )
-    return {row.id: row.name for row in result.scalars().all()}
 
 
 async def _book_appointment(args: dict, ctx: ToolContext) -> str:
@@ -446,8 +446,14 @@ async def _book_appointment(args: dict, ctx: ToolContext) -> str:
         )
 
     name = args["customer_name"].strip()
-    if not name:
-        return "Need the caller's name before booking. Ask for it."
+    if not session.name_was_spoken(name):
+        # Nothing has been booked yet, so this costs a question, not a mistake.
+        session.record_failure()
+        return (
+            f"The caller has not told you a name like {name!r}. Ask \"May I have your "
+            "name?\", wait for their answer, and book under exactly what they say. "
+            "Never use a placeholder."
+        )
 
     try:
         created = await booking_domain.create_booking(
@@ -590,7 +596,7 @@ async def _reschedule_appointment(args: dict, ctx: ToolContext) -> str:
 
 async def _handoff_to_human(args: dict, ctx: ToolContext) -> str:
     ctx.session.handoff = HandoffRequest(reason=args["reason"], summary=args["summary"])
-    target = ctx.business.handoff_phone_e164
+    target = (await ctx.get_snapshot()).business.handoff_phone_e164
     where = f" to {target}" if target else ""
     return (
         f"Handoff recorded ({args['reason']}). Tell the caller you are putting them "

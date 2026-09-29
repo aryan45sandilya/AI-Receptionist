@@ -163,3 +163,25 @@ def _align_up(moment: datetime, tz: ZoneInfo, granularity_min: int) -> datetime:
         seconds=remainder, microseconds=local.microsecond
     )
     return (local + bump).replace(second=0, microsecond=0)
+
+
+def spread(slots: list[Slot], *, min_gap: timedelta, limit: int) -> list[Slot]:
+    """Pick up to ``limit`` slots that are genuinely different choices.
+
+    On a 15-minute grid a 30-minute service is free at 5:00, 5:15 and 5:30, but
+    those are not three options: 5:15 overlaps both neighbours, so offering it
+    means offering something the caller cannot also have. Read aloud it is worse
+    -- "5:00, 5:15 or 5:30" is a sentence of nearly identical times.
+
+    Goes down the list in the order it arrived (soonest first, or closest to what
+    the caller asked for) and keeps a slot only if it starts at least ``min_gap``
+    after every slot already kept. Ranking is preserved; only near-duplicates
+    are dropped.
+    """
+    picked: list[Slot] = []
+    for slot in slots:
+        if all(abs(slot.start - kept.start) >= min_gap for kept in picked):
+            picked.append(slot)
+            if len(picked) >= limit:
+                break
+    return picked

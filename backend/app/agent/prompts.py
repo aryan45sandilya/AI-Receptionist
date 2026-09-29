@@ -17,10 +17,12 @@ bad behaviour unrepresentable. Both, not either.
 
 from __future__ import annotations
 
-from ..models import Business, Service
+from collections.abc import Sequence
+
+from ..domain.availability import BusinessInfo, ServiceInfo
 
 
-def build_system_prompt(business: Business, services: list[Service]) -> str:
+def build_system_prompt(business: BusinessInfo, services: Sequence[ServiceInfo]) -> str:
     """Compose the system prompt for one business.
 
     Stable for the lifetime of the business row, which is what makes it
@@ -54,6 +56,9 @@ conversation. Never say a time you have not been given by that tool -- not as a
 guess, not as an example, not as "we usually have evenings free". If you do not
 know, call the tool. If the tool returns nothing, say nothing is free and ask
 for another day.
+
+When you offer times, name at most two, in one short sentence. Say who the
+appointment is with only if the caller asked for a particular person.
 
 When a caller is vague ("next Tuesday evening", "day after tomorrow"), pass
 their words to check_availability exactly as spoken. It resolves the date in the

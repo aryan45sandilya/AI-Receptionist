@@ -16,12 +16,22 @@ process restarts. The interface stays the same.
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from ..domain.timeslots import Slot
+
+
+# Letters only, in any script: a name is compared as a bag of words, so
+# apostrophes, hyphens, digits and punctuation on either side cannot matter.
+_WORD = re.compile(r"[^\W\d_]+")
+
+
+def _words(text: str) -> list[str]:
+    return _WORD.findall(text.casefold())
 
 
 @dataclass(frozen=True)
@@ -66,6 +76,27 @@ class AgentSession:
     # is one of the documented handoff triggers.
     failed_attempts: int = 0
     handoff: HandoffRequest | None = None
+
+    # Every word the caller has said, for checking that a name the agent wants
+    # to book under was given to it rather than made up.
+    _caller_words: set[str] = field(default_factory=set)
+
+    def note_caller_speech(self, text: str) -> None:
+        """Record an utterance. Called at the start of every turn."""
+        self._caller_words.update(_words(text))
+
+    def name_was_spoken(self, name: str) -> bool:
+        """Whether every word of ``name`` was said by the caller.
+
+        The same idea as slot ids, applied to the other thing a model can make
+        up. It was caught doing exactly that -- booking under "[awaiting]" rather
+        than asking -- so a name is accepted only if the caller said it. Every
+        word must match, so "Asha Menon" is refused if only "Asha" was said, and
+        a speech-to-text spelling the model "corrects" is refused too: it is
+        made to ask again rather than book under a guess.
+        """
+        tokens = _words(name)
+        return bool(tokens) and all(token in self._caller_words for token in tokens)
 
     def offer(self, slots: list[Slot], *, service_id: uuid.UUID, service_name: str,
               staff_lookup: dict[uuid.UUID, str]) -> list[OfferedSlot]:

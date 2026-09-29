@@ -23,14 +23,13 @@ from zoneinfo import ZoneInfo
 from openai import AsyncOpenAI
 from sqlalchemy import select
 
-from ..agent.loop import AgentRunner, TurnResult
-from ..agent.prompts import build_system_prompt
+from ..agent.loop import TurnResult, build_runner
 from ..agent.session import AgentSession
 from ..agent.tools import ToolContext
 from ..config import get_settings
 from ..runtime import run_async
 from ..db import dispose_engine, get_session_factory
-from ..domain import availability, calls as call_log
+from ..domain import calls as call_log
 from ..enums import BookingSource, CallChannel, CallStatus, TurnRole
 from ..models import Business
 
@@ -67,7 +66,6 @@ async def converse(caller_phone: str, business_phone: str | None, show_latency: 
     async with get_session_factory()() as db:
         business = await _load_business(db, business_phone)
         tz = ZoneInfo(business.timezone)
-        services = await availability.list_services(db, business.id)
 
         call = await call_log.start_call(
             db,
@@ -88,19 +86,11 @@ async def converse(caller_phone: str, business_phone: str | None, show_latency: 
         ctx = ToolContext(
             db=db,
             session=agent_session,
-            business=business,
             settings=settings,
             now=datetime.now(UTC),
             source=BookingSource.VOICE,
         )
-        runner = AgentRunner(
-            client=client,
-            settings=settings,
-            # Sorted by name: the system prompt is part of the cached prefix, and
-            # an unstable ordering here would cost every cache hit.
-            system_prompt=build_system_prompt(business, sorted(services, key=lambda s: s.name)),
-            ctx=ctx,
-        )
+        runner = await build_runner(client=client, settings=settings, ctx=ctx)
 
         print(f"\n  {business.name} -- terminal demo")
         print(_dim(f"  call {call.id}  caller {caller_phone}  timezone {business.timezone}"))

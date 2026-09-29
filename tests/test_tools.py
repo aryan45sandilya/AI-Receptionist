@@ -47,7 +47,8 @@ def a_future_monday_at_ten() -> datetime:
 
 
 @pytest_asyncio.fixture
-async def ctx(db, seeded) -> ToolContext:
+async def bare_ctx(db, seeded) -> ToolContext:
+    """A conversation in which the caller has not yet said anything."""
     session = AgentSession(
         business_id=seeded.business_id,
         business_name=seeded.business.name,
@@ -57,11 +58,22 @@ async def ctx(db, seeded) -> ToolContext:
     return ToolContext(
         db=db,
         session=session,
-        business=seeded.business,
         settings=get_settings(),
         now=a_future_monday_at_ten(),
         source=BookingSource.VOICE,
     )
+
+
+@pytest_asyncio.fixture
+async def ctx(bare_ctx) -> ToolContext:
+    """The same conversation, after the caller has given their name.
+
+    That is how a real booking goes, and it is what the name guard requires:
+    book_appointment refuses any name the caller never said. Tests about the
+    guard itself use ``bare_ctx``.
+    """
+    bare_ctx.session.note_caller_speech("Hi, this is Asha Menon. Asha again, for a rebooking.")
+    return bare_ctx
 
 
 async def check(ctx, service="Dental cleaning", when="today evening", staff=None) -> str:
@@ -83,6 +95,17 @@ async def test_check_availability_returns_real_slots_with_ids(ctx):
     assert "[s1]" in result
     # The ids in the text are the ids the session will accept.
     assert set(ctx.session.offered) == {"s1", "s2", "s3"}
+
+
+async def test_offered_slots_are_far_enough_apart_to_all_be_bookable(ctx):
+    """A 30-minute service on a 15-minute grid: offering 5:00, 5:15 and 5:30
+    would be offering options the caller cannot also have."""
+    from datetime import timedelta
+
+    await check(ctx)
+    starts = sorted(slot.start for slot in ctx.session.offered.values())
+    assert len(starts) >= 2
+    assert all(later - earlier >= timedelta(minutes=30) for earlier, later in zip(starts, starts[1:]))
 
 
 async def test_offered_slots_are_inside_opening_hours(ctx):
@@ -296,6 +319,56 @@ async def test_booking_without_a_name_asks_for_one(ctx):
     assert "name" in result.lower()
 
 
+async def test_booking_under_a_name_the_caller_never_said_is_refused(bare_ctx, sessionmaker_for, seeded):
+    """Found in a live call: told "yes, the first one", the model booked under
+    "[awaiting]" instead of asking. It is now refused, and nothing is written."""
+    await check(bare_ctx)
+    slot = bare_ctx.session.offered["s1"]
+    bare_ctx.session.note_caller_speech("Yes, the first one works for me.")
+
+    result = await execute_tool(
+        "book_appointment",
+        {"slot_id": "s1", "customer_name": "[awaiting]", "customer_phone": None},
+        bare_ctx,
+    )
+    assert "May I have your name" in result
+    assert "Booked." not in result
+    async with sessionmaker_for() as check_db:
+        assert await count_booked(check_db, seeded.business_id, slot.start) == 0
+
+
+async def test_the_refused_booking_can_be_completed_once_the_caller_gives_a_name(bare_ctx):
+    """The refusal is a question, not a dead end: the slot is still on offer."""
+    await check(bare_ctx)
+    bare_ctx.session.note_caller_speech("Yes, the first one works for me.")
+    refused = await execute_tool(
+        "book_appointment",
+        {"slot_id": "s1", "customer_name": "Guest", "customer_phone": None},
+        bare_ctx,
+    )
+    assert "Booked." not in refused
+
+    bare_ctx.session.note_caller_speech("My name is Asha Menon")
+    booked = await execute_tool(
+        "book_appointment",
+        {"slot_id": "s1", "customer_name": "Asha Menon", "customer_phone": None},
+        bare_ctx,
+    )
+    assert "Booked." in booked
+
+
+async def test_a_refused_name_counts_toward_the_handoff_policy(bare_ctx):
+    """An agent that keeps trying to book without a name is not making progress."""
+    await check(bare_ctx)
+    before = bare_ctx.session.failed_attempts
+    await execute_tool(
+        "book_appointment",
+        {"slot_id": "s1", "customer_name": "Unknown", "customer_phone": None},
+        bare_ctx,
+    )
+    assert bare_ctx.session.failed_attempts == before + 1
+
+
 # ---------------------------------------------------------------------------
 # cancel_appointment
 # ---------------------------------------------------------------------------
@@ -432,13 +505,13 @@ async def test_handoff_records_reason_and_summary(ctx):
     assert "putting them through" in result
 
 
-async def test_handoff_mentions_the_transfer_number_when_configured(ctx):
+async def test_handoff_mentions_the_transfer_number_when_configured(ctx, seeded):
     result = await execute_tool(
         "handoff_to_human",
         {"reason": "outside_booking_scope", "summary": "Asking about X-ray results."},
         ctx,
     )
-    assert ctx.business.handoff_phone_e164 in result
+    assert seeded.business.handoff_phone_e164 in result
 
 
 # ---------------------------------------------------------------------------

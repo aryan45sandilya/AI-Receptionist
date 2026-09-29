@@ -70,9 +70,27 @@ class Settings(BaseSettings):
     # smaller free alternatives worth benchmarking against it in Phase 6.
     llm_model: str = "openai/gpt-oss-120b"
     llm_max_tokens: int = 1024
+    # gpt-oss is a reasoning model: it spends hidden tokens thinking before the
+    # first spoken word. Measured on Groq, "low" cut time to first word from
+    # ~1500 ms to ~500 ms (reasoning tokens 64 -> 11), which is the difference
+    # between a natural pause and dead air on a phone call. Empty string omits
+    # the parameter, for models that reject it.
+    llm_reasoning_effort: str = "low"
     # Low, but not zero. A receptionist should be predictable rather than
     # inventive; a little variation stops it sounding like a recording.
     llm_temperature: float = 0.3
+
+    # --- Speech (also Groq: one key covers the whole pipeline) ---------------
+    stt_model: str = "whisper-large-v3-turbo"
+    # Pinned, not auto-detected. Callers mix English and Tamil mid-sentence, and
+    # left to guess, the model sometimes decides a whole utterance is Tamil and
+    # translates it -- silently changing what the caller said.
+    stt_language: str = "en"
+    # Orpheus needs its terms accepted once per Groq organisation:
+    # https://console.groq.com/playground?model=canopylabs%2Forpheus-v1-english
+    tts_model: str = "canopylabs/orpheus-v1-english"
+    # Groq's Orpheus voices: autumn, diana, hannah, austin, daniel, troy.
+    tts_voice: str = "hannah"
 
     # --- Booking policy -----------------------------------------------------
     slot_granularity_min: int = 15

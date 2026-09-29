@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Voice demo</title>
+  <link rel="icon" href="data:,">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&display=swap">
+  <link rel="stylesheet" href="demo.css">
+</head>
+<body>
+  <header class="bar">
+    <h1 id="business">Voice demo</h1>
+    <p id="clock" class="muted"></p>
+  </header>
+
+  <main>
+    <section class="controls" aria-label="Call controls">
+      <button id="start" type="button">Start call</button>
+      <button id="hangup" type="button" disabled>Hang up</button>
+      <p id="state" class="state" role="status" aria-live="polite">Not connected</p>
+    </section>
+
+    <p id="notice" class="notice" role="alert" hidden></p>
+
+    <div class="columns">
+      <section aria-labelledby="transcript-h">
+        <h2 id="transcript-h">Conversation</h2>
+        <ol id="transcript" class="ruled">
+          <li class="empty">Press Start call and allow the microphone. Speak when you hear the greeting.</li>
+        </ol>
+      </section>
+
+      <section aria-labelledby="latency-h">
+        <h2 id="latency-h">Time to reply</h2>
+        <p class="muted small">Milliseconds from the moment you stopped speaking. Each stage is also saved to the database.</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Turn</th>
+                <th scope="col">Waited to be sure you finished</th>
+                <th scope="col">Transcript ready</th>
+                <th scope="col">First word written</th>
+                <th scope="col">First sound played</th>
+              </tr>
+            </thead>
+            <tbody id="latency">
+              <tr class="empty"><td colspan="5">No replies yet.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script type="module" src="demo.js"></script>
+</body>
+</html>
