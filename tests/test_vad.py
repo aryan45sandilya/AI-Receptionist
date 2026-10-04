@@ -218,3 +218,119 @@ def test_reset_clears_a_part_heard_utterance():
     detector.reset()
     assert detector.in_speech is False
     assert events_of(detector, silence(1200)) == []
+
+
+# --------------------------------------------------------------------------
+# Telephone audio, and the readings barge-in is built on
+# --------------------------------------------------------------------------
+
+PHONE = 8_000
+
+
+def test_a_telephone_rate_detector_finds_an_utterance_in_eight_kilohertz_audio():
+    """A call arrives at 8 kHz, so a frame is half as many bytes. The detector
+    keys on energy, so only the frame size needed to change."""
+    detector = VoiceActivityDetector(sample_rate=PHONE)
+    pcm = silence(200, PHONE) + tone(700, rate=PHONE) + silence(1200, PHONE)
+    kinds = [event for event, _ in detector.feed(pcm)]
+    assert kinds == [Event.SPEECH_STARTED, Event.SPEECH_ENDED]
+
+
+def test_a_telephone_rate_detector_still_ignores_silence_and_room_tone():
+    detector = VoiceActivityDetector(sample_rate=PHONE)
+    assert detector.feed(silence(2000, PHONE) + hiss(2000, rate=PHONE)) == []
+
+
+def test_a_telephone_rate_utterance_is_the_right_length():
+    detector = VoiceActivityDetector(sample_rate=PHONE)
+    results = detector.feed(tone(600, rate=PHONE) + silence(1200, PHONE))
+    audio = results[-1][1]
+    bytes_per_ms = PHONE * 2 // 1000
+    assert audio is not None
+    assert 600 * bytes_per_ms * 0.9 <= len(audio) < (600 + 900) * bytes_per_ms
+
+
+def test_speech_ms_counts_up_while_the_caller_keeps_talking():
+    detector = VoiceActivityDetector()
+    assert detector.speech_ms == 0
+    detector.feed(tone(400))
+    assert detector.in_speech
+    # From the frame that first sounded like speech, including the 100 ms that
+    # it took to be sure.
+    assert 380 <= detector.speech_ms <= 420
+    detector.feed(tone(200))
+    assert 580 <= detector.speech_ms <= 620
+
+
+def test_speech_ms_is_zero_before_speech_and_after_it_ends():
+    detector = VoiceActivityDetector()
+    detector.feed(silence(500))
+    assert detector.speech_ms == 0
+    detector.feed(tone(500) + silence(1200))
+    assert detector.in_speech is False
+    assert detector.speech_ms == 0
+
+
+def test_a_short_burst_never_reaches_a_barge_in_length():
+    """The reason barge-in measures duration: a cough or a click can trip the
+    detector, but it is over long before it counts as the caller talking."""
+    detector = VoiceActivityDetector()
+    detector.feed(tone(160))
+    assert detector.in_speech
+    assert detector.speech_ms < 300
+
+
+def test_quiet_ms_counts_the_silence_since_the_last_loud_frame():
+    detector = VoiceActivityDetector()
+    detector.feed(tone(500))
+    assert detector.quiet_ms == 0
+    detector.feed(silence(300))
+    assert 280 <= detector.quiet_ms <= 320
+
+
+def test_quiet_ms_starts_again_when_the_caller_resumes():
+    detector = VoiceActivityDetector()
+    detector.feed(tone(400) + silence(400) + tone(100))
+    assert detector.quiet_ms == 0
+
+
+def test_quiet_ms_is_zero_when_no_utterance_is_open():
+    detector = VoiceActivityDetector()
+    detector.feed(silence(1000))
+    assert detector.quiet_ms == 0
+
+
+def test_reset_clears_the_speech_clock():
+    detector = VoiceActivityDetector()
+    detector.feed(tone(400))
+    detector.reset()
+    assert detector.speech_ms == 0 and detector.quiet_ms == 0
+
+
+def test_voiced_ms_counts_talking_not_the_silence_after_it():
+    """A cough is 120 ms of sound and then nothing. Elapsed time since it began
+    keeps growing through the silence; voiced time does not, which is what makes
+    the difference between a cough and an interruption."""
+    detector = VoiceActivityDetector()
+    detector.feed(tone(120))
+    assert detector.in_speech
+    voiced = detector.voiced_ms
+    assert 100 <= voiced <= 140
+
+    detector.feed(silence(600))
+    assert detector.in_speech, "still open: 800 ms of quiet has not passed"
+    assert detector.speech_ms > 600, "elapsed time keeps counting"
+    assert detector.voiced_ms == voiced, "talking time does not"
+
+
+def test_voiced_ms_keeps_growing_while_the_caller_talks_with_short_pauses():
+    detector = VoiceActivityDetector()
+    detector.feed(tone(300) + silence(200) + tone(300))
+    assert 760 <= detector.voiced_ms <= 820
+
+
+def test_voiced_ms_is_zero_outside_an_utterance():
+    detector = VoiceActivityDetector()
+    assert detector.voiced_ms == 0
+    detector.feed(tone(500) + silence(1200))
+    assert detector.voiced_ms == 0

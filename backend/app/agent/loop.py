@@ -1,10 +1,28 @@
 """The streaming tool-use loop, against Groq's OpenAI-compatible endpoint.
 
-A manual loop rather than a framework. From Phase 3 this has to support
-barge-in: when the caller talks over the agent, playback stops and the in-flight
-turn is abandoned mid-stream. That needs the ability to break out of the stream,
-discard pending tool calls and keep the message history consistent, which means
-owning the loop. The latency measurements belong at the same seams.
+A manual loop rather than a framework, because of barge-in: when the caller
+talks over the agent, playback stops and the in-flight turn is abandoned
+mid-stream. That needs the ability to break out of the stream, and to keep the
+message history consistent when it does, which means owning the loop. The
+latency measurements belong at the same seams.
+
+Interrupting a turn (``run_turn`` cancelled) follows three rules:
+
+*   **A tool in flight is never abandoned.** Speech and generation stop at once,
+    but a tool that has begun -- most importantly a booking being written --
+    runs to completion, and its result goes into history. A half-written booking
+    is worse than one the caller did not hear confirmed.
+*   **History stays valid.** Every tool call has its result. If nothing at all
+    had happened -- no tool run, no word heard -- the caller's words are taken
+    back out of history and handed back (``Interruption.clean``) to be joined to
+    whatever they say next, so a pause that cut a sentence in two does not
+    become two separate requests.
+*   **History says what the caller heard.** The reply that was cut off is
+    recorded as the part that got out, not the part the model had planned
+    (``settle_interruption``), so it does not believe it said something nobody
+    heard. This applies whenever the caller cuts in: while the model is still
+    writing, or -- far more often, because a reply is written in under a second
+    and takes several to say -- after it has finished and is only being spoken.
 
 Streaming is on from Phase 1 even though a terminal does not need it, because
 Phase 2 pipes these same text chunks into TTS. Getting the first sentence to the
@@ -17,6 +35,8 @@ OpenAI-compatible, so another provider is a configuration change.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import time
 from collections.abc import Callable
@@ -66,6 +86,16 @@ class TurnMetrics:
     cache_read_tokens: int = 0
     model: str | None = None
 
+    # When the caller first heard anything, if that was a stopgap ("one moment")
+    # said while a tool ran rather than the answer itself. Set by the voice layer.
+    filler_ms: int | None = None
+
+    # True once the stage times above have been moved from "since this turn
+    # began" onto the call's clock (the moment the caller stopped talking). Set
+    # by the voice layer; stops an interruption that arrives mid-way through
+    # reporting from moving them twice.
+    rebased: bool = False
+
 
 @dataclass
 class TurnResult:
@@ -74,6 +104,40 @@ class TurnResult:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     stop_reason: str | None = None
     handoff: bool = False
+
+
+@dataclass
+class Interruption:
+    """A turn that was cancelled while the model was still working on it.
+
+    (An interruption that lands after the model has finished has no such record:
+    the turn completed, and ``TurnResult`` says what it did.) Left unsettled until
+    the speech side says how much of the reply the caller actually heard --
+    ``AgentRunner.settle_interruption`` -- because that decides what the history
+    should say. Afterwards ``clean`` is True if the turn had done nothing the
+    caller could have noticed: no tool run, no word heard. The user's message has
+    then been taken back out of history, and ``user_text`` is theirs to hand back:
+    the caller was most likely still mid-sentence, and what they say next belongs
+    with it, not in a second turn of its own.
+    """
+
+    history_mark: int
+    user_text: str
+    text: str  # what the model had written when it was cut off
+    tool_calls: list[dict[str, Any]]
+    metrics: TurnMetrics
+    clean: bool = False
+    settled: bool = False
+
+
+# What goes into history for a tool the model asked for but the caller's
+# interruption stopped from running. Every tool call needs a result or the next
+# request is malformed.
+SKIPPED_TOOL_RESULT = "SKIPPED: the caller interrupted before this ran."
+
+# Marks a reply the caller cut off, in the model's own history. The system prompt
+# explains it.
+INTERRUPTED_MARK = "[interrupted]"
 
 
 class AgentRunner:
@@ -95,10 +159,56 @@ class AgentRunner:
         # Only the conversation itself. The system message is rebuilt per
         # request so it can carry the current time.
         self._messages: list[dict[str, Any]] = []
+        # Set when a turn was cancelled while the model was still on it; cleared
+        # when the next turn starts.
+        self.interruption: Interruption | None = None
+        # The latest turn's place in history, kept after it completes so that an
+        # interruption during its *speech* can still be settled.
+        self._open_turn: int | None = None
 
     @property
     def messages(self) -> list[dict[str, Any]]:
         return self._messages
+
+    def settle_interruption(self, heard: str) -> bool:
+        """Put the history in order after the caller cut the latest turn short.
+
+        True if the turn was clean. ``heard`` is what the caller got to hear of
+        the reply, which is not what the model wrote: it was cut off, and may
+        never have started. If nothing happened -- no tool ran and nothing was
+        heard -- the turn is erased, so the caller's words can be merged with
+        what they say next. Otherwise it stays, its reply replaced by what was
+        heard and a mark saying the caller cut in.
+
+        Works wherever the interruption landed: mid-generation (the reply is not
+        in history yet, so it is appended) or after the model finished (the whole
+        planned reply is in history, so it is trimmed to what was heard). Settles
+        a turn once; a second call changes nothing.
+        """
+        mark, self._open_turn = self._open_turn, None
+        interruption = self.interruption
+        if mark is None:
+            return bool(interruption and interruption.settled and interruption.clean)
+
+        heard = heard.strip()
+        # Any tool message after the user's own is a tool that ran (or, for one
+        # the interruption stopped, a note that it did not).
+        tools_ran = any(m["role"] == "tool" for m in self._messages[mark:])
+        clean = not tools_ran and not heard
+        if clean:
+            del self._messages[mark:]
+        else:
+            content = f"{heard} {INTERRUPTED_MARK}" if heard else INTERRUPTED_MARK
+            last = self._messages[-1] if len(self._messages) > mark + 1 else None
+            if last is not None and last["role"] == "assistant" and not last.get("tool_calls"):
+                # The model's whole planned reply is here; the caller heard some of it.
+                self._messages[-1] = {"role": "assistant", "content": content}
+            else:
+                self._messages.append({"role": "assistant", "content": content})
+
+        if interruption is not None:
+            interruption.clean, interruption.settled = clean, True
+        return clean
 
     def _hand_off(self, why: str) -> None:
         """Record that the agent is giving the call up, if nothing else has.
@@ -135,15 +245,19 @@ class AgentRunner:
         *,
         now: datetime,
         on_text: Callable[[str], None] | None = None,
+        on_tool_call: Callable[[str], None] | None = None,
     ) -> TurnResult:
         """Handle one caller utterance, running tools until the model is done.
 
         ``on_text`` receives text as it streams. In the terminal that prints it;
-        from Phase 2 it feeds the speech engine.
+        from Phase 2 it feeds the speech engine. ``on_tool_call`` is told the name
+        of the first tool the model asks for in the turn, the moment it asks --
+        well before the tool has run -- so something can fill the silence.
         """
         anchor = time.perf_counter()
         metrics = TurnMetrics(turn_started_at=now, model=self._settings.llm_model)
         self._ctx.now = now
+        self.interruption = None
 
         # Where this turn's messages start. If the turn dies partway -- a dropped
         # connection, a timeout -- history is rewound to here. Leaving a user
@@ -151,6 +265,7 @@ class AgentRunner:
         # turning one transient failure into a dead conversation.
         history_mark = len(self._messages)
         self._messages.append({"role": "user", "content": user_text})
+        self._open_turn = history_mark
         self._ctx.session.note_caller_speech(user_text)
 
         # Owned here rather than in _drive so the error path can still report
@@ -166,9 +281,24 @@ class AgentRunner:
                 collected_text=collected_text,
                 tool_log=tool_log,
                 on_text=on_text,
+                on_tool_call=on_tool_call,
             )
+        except asyncio.CancelledError:
+            # The caller talked over the agent. Not an error, so nothing here
+            # apologises or hands over: what happened is recorded, and the
+            # cancellation carries on for whoever cancelled to act on. History is
+            # left alone until settle_interruption, which knows what was heard.
+            self.interruption = Interruption(
+                history_mark=history_mark,
+                user_text=user_text,
+                text="".join(collected_text).strip(),
+                tool_calls=tool_log,
+                metrics=_finish(metrics, anchor),
+            )
+            raise
         except Exception as exc:  # noqa: BLE001 - one bad turn must not end the call
             del self._messages[history_mark:]
+            self._open_turn = None
             # The provider's own message is kept, not just the exception class.
             # A bare "NotFoundError" hides the one useful fact -- which model
             # was rejected -- and this lands in call_turns.text for the
@@ -193,11 +323,13 @@ class AgentRunner:
         collected_text: list[str],
         tool_log: list[dict[str, Any]],
         on_text: Callable[[str], None] | None,
+        on_tool_call: Callable[[str], None] | None = None,
     ) -> TurnResult:
         """The tool-use loop. Split out so ``run_turn`` owns the history rewind."""
         finish_reason: str | None = None
         empty_retries = 0
         nudge: str | None = None
+        tool_announced = False
 
         for _ in range(MAX_TOOL_ITERATIONS):
             first_token_at: float | None = None
@@ -225,44 +357,59 @@ class AgentRunner:
                 request["reasoning_effort"] = self._settings.llm_reasoning_effort
             stream = await self._client.chat.completions.create(**request)
 
-            async for chunk in stream:
-                if chunk.usage is not None:
-                    metrics.input_tokens += chunk.usage.prompt_tokens or 0
-                    metrics.output_tokens += chunk.usage.completion_tokens or 0
-                if not chunk.choices:
-                    # The usage-only chunk carries no choices.
-                    continue
+            try:
+                async for chunk in stream:
+                    if chunk.usage is not None:
+                        metrics.input_tokens += chunk.usage.prompt_tokens or 0
+                        metrics.output_tokens += chunk.usage.completion_tokens or 0
+                    if not chunk.choices:
+                        # The usage-only chunk carries no choices.
+                        continue
 
-                choice = chunk.choices[0]
-                if choice.finish_reason:
-                    finish_reason = choice.finish_reason
+                    choice = chunk.choices[0]
+                    if choice.finish_reason:
+                        finish_reason = choice.finish_reason
 
-                delta = choice.delta
-                if delta is None:
-                    continue
+                    delta = choice.delta
+                    if delta is None:
+                        continue
 
-                if delta.content:
-                    if first_token_at is None:
-                        first_token_at = time.perf_counter()
-                    text_parts.append(delta.content)
-                    collected_text.append(delta.content)
-                    if on_text is not None:
-                        on_text(delta.content)
+                    if delta.content:
+                        if first_token_at is None:
+                            first_token_at = time.perf_counter()
+                            # Recorded now, not after the stream: a turn the
+                            # caller cuts off never reaches the end of it, and
+                            # its first-word latency is still worth logging.
+                            if metrics.llm_first_token_ms is None:
+                                metrics.llm_first_token_ms = _ms(anchor, first_token_at)
+                        text_parts.append(delta.content)
+                        collected_text.append(delta.content)
+                        if on_text is not None:
+                            on_text(delta.content)
 
-                for fragment in delta.tool_calls or ():
-                    call = partial_calls.setdefault(
-                        fragment.index, {"id": None, "name": "", "arguments": ""}
-                    )
-                    if fragment.id:
-                        call["id"] = fragment.id
-                    if fragment.function is not None:
-                        if fragment.function.name:
-                            call["name"] = fragment.function.name
-                        if fragment.function.arguments:
-                            call["arguments"] += fragment.function.arguments
+                    for fragment in delta.tool_calls or ():
+                        call = partial_calls.setdefault(
+                            fragment.index, {"id": None, "name": "", "arguments": ""}
+                        )
+                        if fragment.id:
+                            call["id"] = fragment.id
+                        if fragment.function is not None:
+                            if fragment.function.name:
+                                call["name"] = fragment.function.name
+                                if on_tool_call is not None and not tool_announced:
+                                    tool_announced = True
+                                    on_tool_call(fragment.function.name)
+                            if fragment.function.arguments:
+                                call["arguments"] += fragment.function.arguments
+            finally:
+                # Closing the response is what stops the provider generating (and
+                # counting) tokens nobody will hear, when the caller interrupts.
+                # A no-op once the stream has been read to its end.
+                close = getattr(stream, "close", None)
+                if close is not None:
+                    with contextlib.suppress(Exception):
+                        await close()
 
-            if metrics.llm_first_token_ms is None and first_token_at is not None:
-                metrics.llm_first_token_ms = _ms(anchor, first_token_at)
             metrics.llm_done_ms = _ms(anchor, time.perf_counter())
 
             assistant_text = "".join(text_parts)
@@ -294,13 +441,7 @@ class AgentRunner:
                 }
             )
 
-            for call in _ordered(partial_calls):
-                output = await self._run_one_tool(call, tool_log)
-                # One message per tool result, each tied back to its call by
-                # tool_call_id. Results must not be merged into one message.
-                self._messages.append(
-                    {"role": "tool", "tool_call_id": call["id"], "content": output}
-                )
+            await self._run_tools(_ordered(partial_calls), tool_log)
 
             # Text from the next model call continues this reply. Without a
             # separator "Let me check.We have..." runs together, which reads
@@ -327,6 +468,41 @@ class AgentRunner:
             stop_reason=finish_reason,
             handoff=self._ctx.session.handoff is not None,
         )
+
+    async def _run_tools(
+        self, calls: list[dict[str, Any]], tool_log: list[dict[str, Any]]
+    ) -> None:
+        """Run the requested tools in order, putting each result into history.
+
+        Each runs as its own task behind a shield. If the turn is cancelled while
+        one is running -- the caller interrupted -- the cancellation waits: the
+        tool finishes, its result is recorded, the tools that had not started are
+        recorded as skipped, and only then does the cancellation carry on. A
+        booking is either made and remembered or not made; it is never made and
+        forgotten.
+        """
+        done = 0
+        try:
+            for call in calls:
+                task = asyncio.ensure_future(self._run_one_tool(call, tool_log))
+                try:
+                    output = await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    output = await task
+                    self._append_tool_result(call, output)
+                    done += 1
+                    raise
+                # One message per tool result, each tied back to its call by
+                # tool_call_id. Results must not be merged into one message.
+                self._append_tool_result(call, output)
+                done += 1
+        except asyncio.CancelledError:
+            for call in calls[done:]:
+                self._append_tool_result(call, SKIPPED_TOOL_RESULT)
+            raise
+
+    def _append_tool_result(self, call: dict[str, Any], output: str) -> None:
+        self._messages.append({"role": "tool", "tool_call_id": call["id"], "content": output})
 
     async def _run_one_tool(
         self, call: dict[str, Any], tool_log: list[dict[str, Any]]

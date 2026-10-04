@@ -1,43 +1,133 @@
 """Speech to text, and text to speech.
 
 Both sit behind small protocols so the rest of the pipeline never learns which
-service is on the other end. That is not decoration: the two implementations
-here are batch services, and a streaming one (Deepgram for transcription,
-Cartesia for speech) has a different shape -- swapping one in should touch this
-file only.
+service is on the other end. That is not decoration: there are two very
+different kinds of service, and the pipeline has to work with either.
 
-The batch/streaming distinction is the main latency story in this phase:
+*   **Batch** (Groq: Whisper, Orpheus). Transcription takes a finished
+    recording, so it cannot start until the caller stops talking; speech comes
+    back as a whole clip per request, so it is requested a sentence at a time.
+*   **Streaming** (Deepgram, in ``deepgram.py``). Transcription runs while the
+    caller is still talking, so most of it is ready when they stop; speech
+    arrives as a stream of small chunks, so it starts playing before the
+    sentence has finished being made.
 
-*   Transcription only starts once the caller stops talking, because a batch
-    service needs the whole utterance. A streaming service would have most of
-    the transcript ready by then. Costs roughly the length of the utterance.
-
-*   Speech is synthesised a sentence at a time rather than all at once, so the
-    caller hears the first sentence while the second is still being made. With
-    a batch service this is the difference between speaking after ~200 ms and
-    speaking after the whole reply is finished.
+The interfaces below are shaped for the streaming kind, because that is the
+harder one to fit into after the fact. A batch service is adapted up to them
+(``BatchTranscriber``, ``ClipSynthesizer``) rather than the other way round: a
+whole clip is simply a stream with one chunk in it.
 """
 
 from __future__ import annotations
 
 import io
 import re
+from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Protocol
 
 from openai import AsyncOpenAI
 
 from .audio import Pcm, from_wav, to_mono, to_wav
 
-# What the detector produces and the transcription service expects.
+# What the browser sends and the transcription service expects by default. A
+# telephone call is 8 kHz, and says so wherever it matters.
 STT_SAMPLE_RATE = 16_000
 
 
 class SpeechToText(Protocol):
+    """A service that transcribes a finished recording."""
+
     async def transcribe(self, pcm: Pcm) -> str: ...
 
 
+class Transcriber(Protocol):
+    """Turns the caller's speech into text, one utterance at a time.
+
+    Shaped for a service that listens while the caller talks. The caller of
+    this interface does not wait for the end of the utterance to hand audio over:
+
+        transcriber.begin()
+        await transcriber.send(chunk)        # as each chunk of audio arrives
+        ...
+        text = await transcriber.finish()    # the utterance is over
+
+    Two callbacks run while it is going on. ``on_interim`` receives the words so
+    far, for a live caption. ``on_endpoint`` fires when the *service* decides the
+    caller has finished -- a streaming service listens for a pause and usually
+    decides sooner than the detector would -- and the owner then calls
+    ``finish`` without waiting for its own silence timer.
+    """
+
+    on_interim: Callable[[str], None] | None
+    on_endpoint: Callable[[], None] | None
+    # True if the service decides for itself when the caller has finished (and
+    # says so through ``on_endpoint``). The call then treats its own silence timer
+    # as a backstop rather than the primary clock.
+    endpoints_itself: bool
+
+    async def start(self, *, keyterms: Sequence[str] = ()) -> None:
+        """Get ready (open the connection). ``keyterms`` are words the service
+        should favour: the business's own services and staff names."""
+        ...
+
+    def begin(self) -> None: ...
+
+    async def send(self, pcm: bytes) -> None: ...
+
+    async def finish(self, utterance: bytes | None = None) -> str:
+        """The utterance is over; return what was said, or "" if nothing was.
+
+        ``utterance`` is the detector's own copy of the finished audio. A
+        streaming service already has it and ignores the argument; a batch
+        service has nothing else to work from."""
+        ...
+
+    def abandon(self) -> None:
+        """Throw away the utterance in progress."""
+        ...
+
+    async def close(self) -> None: ...
+
+
 class TextToSpeech(Protocol):
-    async def synthesize(self, text: str) -> Pcm: ...
+    """Speaks text as a stream of audio chunks.
+
+    One request at a time. ``cancel`` is for barge-in: it drops whatever the
+    service is still sending for the request in flight, so the next request
+    starts clean.
+    """
+
+    def stream(self, text: str) -> AsyncIterator[Pcm]: ...
+
+    async def start(self) -> None: ...
+
+    async def cancel(self) -> None: ...
+
+    async def close(self) -> None: ...
+
+
+class ClipSynthesizer:
+    """Gives a synthesiser that returns whole clips the streaming interface.
+
+    Subclasses write ``synthesize``; this supplies the rest. A clip is a stream
+    with one chunk, and a service with no connection to warm up and no audio in
+    flight has nothing to start or cancel.
+    """
+
+    async def synthesize(self, text: str) -> Pcm:
+        raise NotImplementedError
+
+    async def stream(self, text: str) -> AsyncIterator[Pcm]:
+        yield await self.synthesize(text)
+
+    async def start(self) -> None:
+        return None
+
+    async def cancel(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +197,47 @@ class GroqWhisper:
         return "" if looks_like_silence(text) else text
 
 
+class BatchTranscriber:
+    """Adapts a service that takes a finished recording to ``Transcriber``.
+
+    Nothing is sent while the caller talks, because this kind of service has no
+    use for half an utterance. ``finish`` hands it the whole of what the
+    detector collected. The live-caption and early-endpoint callbacks exist so
+    the owner can set them without asking what it is talking to, and never fire.
+    """
+
+    def __init__(self, stt: SpeechToText, *, sample_rate: int = STT_SAMPLE_RATE) -> None:
+        self._stt = stt
+        self._sample_rate = sample_rate
+        self._heard = bytearray()
+        self.on_interim: Callable[[str], None] | None = None
+        self.on_endpoint: Callable[[], None] | None = None
+        self.endpoints_itself = False
+
+    async def start(self, *, keyterms: Sequence[str] = ()) -> None:
+        return None
+
+    def begin(self) -> None:
+        self._heard.clear()
+
+    async def send(self, pcm: bytes) -> None:
+        # Kept only as a fallback for a finish() that is not given the audio.
+        self._heard.extend(pcm)
+
+    async def finish(self, utterance: bytes | None = None) -> str:
+        audio = bytes(self._heard) if utterance is None else utterance
+        self._heard.clear()
+        if not audio:
+            return ""
+        return await self._stt.transcribe(Pcm(data=audio, sample_rate=self._sample_rate))
+
+    def abandon(self) -> None:
+        self._heard.clear()
+
+    async def close(self) -> None:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Speech synthesis
 # ---------------------------------------------------------------------------
@@ -167,6 +298,11 @@ class SentenceStream:
         self._released = False  # has any piece been handed out yet?
         self._pending = ""  # text after the last confirmed sentence boundary
         self._held = ""  # a finished but too-short sentence, awaiting a neighbour
+
+    @property
+    def has_pending(self) -> bool:
+        """Is there text that has arrived but not yet been released as a sentence?"""
+        return bool(self._pending.strip() or self._held)
 
     def feed(self, chunk: str) -> list[str]:
         """Add streamed text; return any sentences it completed."""
@@ -256,7 +392,7 @@ def split_sentences(
     return [*stream.feed(text), *stream.flush()]
 
 
-class GroqOrpheus:
+class GroqOrpheus(ClipSynthesizer):
     """Batch speech synthesis.
 
     Returns a whole clip per request, so the caller feeds it one sentence at a

@@ -12,6 +12,7 @@ const els = {
   clock: $("clock"),
   start: $("start"),
   hangup: $("hangup"),
+  interrupt: $("interrupt"),
   state: $("state"),
   notice: $("notice"),
   transcript: $("transcript"),
@@ -26,6 +27,7 @@ const call = {
   playback: null,
   resampler: null,
   agentLine: null, // the transcript row the current reply streams into
+  youLine: null, // the row showing what is being heard, while the caller speaks
   turns: 0,
 };
 
@@ -60,6 +62,41 @@ function addLine(who, text, kind) {
   return body;
 }
 
+// The caller's own line, shown as it is heard and settled when the transcript
+// arrives. One row for the whole utterance, so words appearing never stack up as
+// separate lines and the final text replaces the captions in place.
+function showHeard(text) {
+  if (!call.youLine) {
+    call.youLine = addLine("You", "", "you heard");
+  }
+  call.youLine.textContent = text;
+}
+
+function settleHeard(text) {
+  if (call.youLine) {
+    call.youLine.textContent = text;
+    call.youLine.parentElement.classList.remove("heard");
+    call.youLine = null;
+  } else {
+    addLine("You", text, "you");
+  }
+}
+
+function dropHeard() {
+  if (call.youLine) {
+    call.youLine.parentElement.remove();
+    call.youLine = null;
+  }
+}
+
+function addNote(text) {
+  const li = document.createElement("li");
+  li.className = "note";
+  li.textContent = text;
+  els.transcript.append(li);
+  li.scrollIntoView({ block: "nearest" });
+}
+
 function addLatencyRow(m) {
   const empty = els.latency.querySelector(".empty");
   if (empty) empty.remove();
@@ -73,12 +110,16 @@ function addLatencyRow(m) {
     return td;
   };
   const turn = document.createElement("td");
-  turn.textContent = String(call.turns);
+  // A reply the caller cut off still has timings worth reading; it is marked.
+  turn.textContent = m.interrupted ? `${call.turns} (cut off)` : String(call.turns);
   tr.append(
     turn,
     cell(m.endpoint_ms),
     cell(m.stt_final_ms),
     cell(m.llm_first_token_ms),
+    // The line stops being silent at the stopgap if there was one, else at the
+    // answer; the answer is when what they were waiting for begins.
+    cell(m.filler_ms ?? m.total_ms),
     cell(m.total_ms),
   );
   els.latency.append(tr);
@@ -136,15 +177,33 @@ function onEvent(message) {
 
     case "speech_ended":
       setState(message.used ? "Thinking" : "Listening", message.used ? "" : "listening");
+      if (!message.used) dropHeard();
+      break;
+
+    case "interim":
+      // Words as the service hears them, before it has decided they are final.
+      showHeard(message.text);
       break;
 
     case "transcript":
       if (message.discarded) {
+        dropHeard();
         setState("Listening", "listening");
       } else {
-        addLine("You", message.text, "you");
+        settleHeard(message.text);
         call.agentLine = null;
       }
+      break;
+
+    case "clear":
+      // The caller talked over the agent. Everything queued for the speaker is
+      // stale: empty it now, and ignore audio still in flight until the next
+      // reply announces itself.
+      if (call.playback) call.playback.port.postMessage("flush");
+      call.resampler = null;
+      call.agentLine = null;
+      addNote("You interrupted.");
+      setState("Hearing you");
       break;
 
     case "agent_delta":
@@ -167,7 +226,9 @@ function onEvent(message) {
       // Not hidden: the reply is on screen, but the caller heard nothing.
       showNotice(
         "The voice could not speak: " + message.message +
-        " If it mentions terms, accept them once in the Groq console for the Orpheus model."
+        (/terms/i.test(message.message)
+          ? " Accept the model's terms once in the Groq console for the Orpheus model."
+          : "")
       );
       break;
 
@@ -251,6 +312,7 @@ async function startCall() {
   call.ws = ws;
 
   ws.onopen = () => {
+    sendConfig();
     const source = call.ctx.createMediaStreamSource(call.stream);
     call.capture = new AudioWorkletNode(call.ctx, "capture", {
       processorOptions: { targetRate: 16000 },
@@ -280,6 +342,16 @@ async function startCall() {
   };
 }
 
+// Whether the agent should stop when talked over. Sent when the call opens and
+// whenever the box changes, so it can be switched mid-call if the agent starts
+// interrupting itself through the speakers.
+function sendConfig() {
+  if (call.ws && call.ws.readyState === WebSocket.OPEN) {
+    call.ws.send(JSON.stringify({ type: "config", barge_in: els.interrupt.checked }));
+  }
+}
+els.interrupt.addEventListener("change", sendConfig);
+
 function endCall(label) {
   if (call.ws && call.ws.readyState === WebSocket.OPEN) {
     call.ws.send(JSON.stringify({ type: "hangup" }));
@@ -291,7 +363,10 @@ function endCall(label) {
     call.capture.disconnect();
   }
   if (call.ctx) call.ctx.close();
-  Object.assign(call, { ws: null, ctx: null, stream: null, capture: null, playback: null, resampler: null });
+  Object.assign(call, {
+    ws: null, ctx: null, stream: null, capture: null, playback: null, resampler: null,
+    agentLine: null, youLine: null,
+  });
 
   els.start.disabled = false;
   els.hangup.disabled = true;

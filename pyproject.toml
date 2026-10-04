@@ -12,6 +12,7 @@ dependencies = [
     "pydantic>=2",
     "pydantic-settings>=2",
     "openai>=2",
+    "httpx2",
     "websockets",
     "python-dotenv",
     "tzdata",

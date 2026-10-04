@@ -7,6 +7,7 @@ stream a real model produces, deterministically, without a network or API quota.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 
@@ -47,8 +48,35 @@ class Stream:
         return self._chunks.pop(0)
 
 
+class HangingStream(Stream):
+    """Yields its chunks and then waits forever: a model in the middle of a sentence.
+
+    For testing what happens when the caller cuts in. ``reached_the_end`` is set
+    once every chunk has been read and the stream is waiting; ``closed`` records
+    whether the consumer closed the response, which is what stops a real provider
+    generating tokens nobody will hear.
+    """
+
+    def __init__(self, chunks=()):
+        super().__init__(chunks)
+        self.closed = False
+        self.reached_the_end = asyncio.Event()
+
+    async def __anext__(self):
+        if self._chunks:
+            return self._chunks.pop(0)
+        self.reached_the_end.set()
+        await asyncio.Event().wait()
+
+    async def close(self):
+        self.closed = True
+
+
 class FakeClient:
-    """Replays one scripted chunk sequence per request, and records the requests."""
+    """Replays one scripted chunk sequence per request, and records the requests.
+
+    A script is a list of chunks, or a ready-made stream (for ``HangingStream``).
+    """
 
     def __init__(self, *scripts, raises: Exception | None = None):
         self.scripts = list(scripts)
@@ -64,4 +92,5 @@ class FakeClient:
             raise self._raises
         if not self.scripts:
             raise AssertionError("the loop made more requests than the test scripted")
-        return Stream(self.scripts.pop(0))
+        script = self.scripts.pop(0)
+        return script if isinstance(script, Stream) else Stream(script)

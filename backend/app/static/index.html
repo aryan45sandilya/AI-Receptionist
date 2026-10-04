@@ -20,8 +20,18 @@
     <section class="controls" aria-label="Call controls">
       <button id="start" type="button">Start call</button>
       <button id="hangup" type="button" disabled>Hang up</button>
+      <label class="toggle">
+        <input type="checkbox" id="interrupt" checked>
+        Allow me to interrupt
+      </label>
       <p id="state" class="state" role="status" aria-live="polite">Not connected</p>
     </section>
+
+    <p class="muted small headphones">
+      You can talk over the agent and it will stop. Use headphones: through speakers,
+      its own voice can leak into the microphone and make it interrupt itself. If it
+      does, untick "Allow me to interrupt".
+    </p>
 
     <p id="notice" class="notice" role="alert" hidden></p>
 
@@ -35,7 +45,9 @@
 
       <section aria-labelledby="latency-h">
         <h2 id="latency-h">Time to reply</h2>
-        <p class="muted small">Milliseconds from the moment you stopped speaking. Each stage is also saved to the database.</p>
+        <p class="muted small">Milliseconds from the moment you stopped speaking. Each stage is also saved to the database.
+          When the agent has to look something up it says a few words first, so the first sound can come
+          well before the answer does.</p>
         <div class="table-wrap">
           <table>
             <thead>
@@ -45,10 +57,11 @@
                 <th scope="col">Transcript ready</th>
                 <th scope="col">First word written</th>
                 <th scope="col">First sound played</th>
+                <th scope="col">Answer starts</th>
               </tr>
             </thead>
             <tbody id="latency">
-              <tr class="empty"><td colspan="5">No replies yet.</td></tr>
+              <tr class="empty"><td colspan="6">No replies yet.</td></tr>
             </tbody>
           </table>
         </div>

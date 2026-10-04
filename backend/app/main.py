@@ -1,4 +1,4 @@
-"""The web application: the voice socket and the browser demo page.
+"""The web application: the voice sockets (browser and Twilio) and the demo page.
 
 Run it through ``python -m backend.app.serve`` rather than ``uvicorn`` directly.
 On Windows uvicorn defaults to an event loop psycopg cannot use, and the launcher
@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+from .api.twilio import router as twilio_router
 from .api.voice import router as voice_router
 from .db import dispose_engine
 
@@ -46,6 +47,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="AI Receptionist", lifespan=lifespan)
 app.include_router(voice_router)
+app.include_router(twilio_router)
 
 
 @app.get("/health")

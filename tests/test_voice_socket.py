@@ -14,161 +14,25 @@ events the server sent, is what makes that a claim about what was stored.
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import json
-import uuid
 
 import pytest
 from sqlalchemy import select
 
-from backend.app.api import voice
-from backend.app.api.voice import VoiceCall
 from backend.app.enums import CallStatus, TurnRole
-from backend.app.models import Call, CallTurn
-from backend.app.voice.audio import Pcm
 from tests.audio_helpers import hiss, silence, tone
-from tests.fakes import FakeClient, finish, text, tool, usage
+from tests.fakes import FakeClient, finish, text, tool
+from tests.voice_helpers import (
+    CHECK_ARGS,
+    HANDOFF,
+    OFFER,
+    FakeSTT,
+    FakeTTS,
+    running_call,
+    speak_turn,
+    stored_turns,
+)
 
 pytestmark = pytest.mark.db
-
-CHUNK_BYTES = 1280  # 40 ms of 16 kHz PCM16, the browser's chunk size
-
-CHECK_ARGS = '{"service": "Dental cleaning", "when": "next tuesday evening", "staff_name": null}'
-OFFER = [
-    [tool(0, id="c1", name="check_availability", args=CHECK_ARGS), finish("tool_calls")],
-    [
-        text("We have Tuesday at five o'clock. "),
-        text("Which would suit you best?"),
-        finish("stop"),
-        usage(1234, 56),
-    ],
-]
-
-
-# ---------------------------------------------------------------------------
-# Doubles
-# ---------------------------------------------------------------------------
-
-class FakeSocket:
-    """Stands in for the WebSocket, and records everything the server sends."""
-
-    def __init__(self) -> None:
-        self._incoming: asyncio.Queue = asyncio.Queue()
-        self.events: list[dict] = []
-        self.audio: list[bytes] = []
-        self.closed = False
-
-    # -- what the server calls
-    async def receive(self) -> dict:
-        return await self._incoming.get()
-
-    async def send_text(self, data: str) -> None:
-        self.events.append(json.loads(data))
-
-    async def send_bytes(self, data: bytes) -> None:
-        self.audio.append(data)
-
-    async def close(self, code: int = 1000) -> None:
-        self.closed = True
-        self._incoming.put_nowait({"type": "websocket.disconnect"})
-
-    # -- what the test does
-    def feed(self, pcm: bytes) -> None:
-        for offset in range(0, len(pcm), CHUNK_BYTES):
-            self._incoming.put_nowait(
-                {"type": "websocket.receive", "bytes": pcm[offset : offset + CHUNK_BYTES]}
-            )
-
-    def hang_up(self) -> None:
-        self._incoming.put_nowait(
-            {"type": "websocket.receive", "text": json.dumps({"type": "hangup"})}
-        )
-
-    def kinds(self) -> list[str]:
-        return [event["type"] for event in self.events]
-
-    def of(self, kind: str) -> list[dict]:
-        return [event for event in self.events if event["type"] == kind]
-
-    async def wait_for(self, kind: str, count: int = 1, timeout: float = 120.0) -> None:
-        async def poll() -> None:
-            while len(self.of(kind)) < count:
-                await asyncio.sleep(0.05)
-
-        try:
-            await asyncio.wait_for(poll(), timeout)
-        except TimeoutError:
-            raise AssertionError(
-                f"timed out waiting for {count}x {kind!r}; saw {self.kinds()}"
-            ) from None
-
-
-class FakeSTT:
-    def __init__(self, *transcripts: str) -> None:
-        self._transcripts = list(transcripts)
-        self.calls = 0
-
-    async def transcribe(self, pcm: Pcm) -> str:
-        self.calls += 1
-        return self._transcripts.pop(0) if self._transcripts else ""
-
-
-class FakeTTS:
-    def __init__(self, *, fail: bool = False, delay: float = 0.0) -> None:
-        self.fail = fail
-        self.delay = delay
-        self.spoken: list[str] = []
-
-    async def synthesize(self, text: str) -> Pcm:
-        self.spoken.append(text)
-        if self.delay:
-            await asyncio.sleep(self.delay)
-        if self.fail:
-            raise RuntimeError("the model requires terms acceptance")
-        return Pcm(data=b"\x01\x00" * 2400, sample_rate=24_000)  # 100 ms
-
-
-@contextlib.asynccontextmanager
-async def running_call(monkeypatch, seeded, *, client, stt, tts, hang_up: bool = True):
-    """Run a call against the seeded business; yield its socket."""
-    monkeypatch.setattr(voice, "build_clients", lambda settings: (client, stt, tts))
-    socket = FakeSocket()
-    call = VoiceCall(socket, business_id=seeded.business_id)
-    call.settings = call.settings.model_copy(update={"llm_api_key": "test-key"})
-    task = asyncio.create_task(call.run())
-    try:
-        yield socket
-    finally:
-        if hang_up:
-            socket.hang_up()
-        try:
-            await asyncio.wait_for(task, 90)
-        except TimeoutError:
-            task.cancel()
-            raise
-
-
-async def speak_turn(socket: FakeSocket, *, turn: int) -> None:
-    """Say something and wait for the server to be listening again.
-
-    ``turn`` counts listening events: 1 is the greeting finishing, so the first
-    spoken turn ends at 2.
-    """
-    await socket.wait_for("listening", count=turn)
-    socket.feed(tone(700) + silence(1200))
-    await socket.wait_for("listening", count=turn + 1)
-
-
-async def stored_turns(sessionmaker_for, socket: FakeSocket) -> tuple[Call, list[CallTurn]]:
-    call_id = uuid.UUID(socket.of("ready")[0]["call_id"])
-    async with sessionmaker_for() as db:
-        call = await db.get(Call, call_id)
-        turns = (
-            await db.execute(
-                select(CallTurn).where(CallTurn.call_id == call_id).order_by(CallTurn.turn_index)
-            )
-        ).scalars().all()
-    return call, list(turns)
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +65,9 @@ async def test_every_stage_of_a_turn_is_written_to_the_database(
     # The stages happen in this order, and each is measured from the same origin.
     assert agent_reply.stt_final_ms < agent_reply.llm_first_token_ms
     assert agent_reply.llm_first_token_ms <= agent_reply.llm_done_ms
-    assert agent_reply.llm_first_token_ms < agent_reply.tts_first_audio_ms
+    # Never before the first word; the same millisecond is possible when both
+    # services are instant.
+    assert agent_reply.llm_first_token_ms <= agent_reply.tts_first_audio_ms
     # What the caller waited is when they first heard something.
     assert agent_reply.total_ms == agent_reply.tts_first_audio_ms
 
@@ -389,11 +255,14 @@ async def test_a_transcript_the_service_filters_as_noise_gets_no_reply(
     assert len(turns) == 1, "only the greeting should be stored"
 
 
-async def test_audio_while_the_agent_is_speaking_is_discarded(monkeypatch, seeded):
-    """Half duplex until barge-in exists: the agent must not hear itself."""
+async def test_with_barge_in_off_audio_while_the_agent_is_speaking_is_discarded(monkeypatch, seeded):
+    """Half duplex, for a setup where the speakers feed the agent its own voice:
+    with barge-in switched off the agent talks through whatever it hears."""
     stt = FakeSTT("I need a dental cleaning next Tuesday evening", "this must never be heard")
     tts = FakeTTS(delay=1.0)  # slow enough that the reply is still being made
-    async with running_call(monkeypatch, seeded, client=FakeClient(*OFFER), stt=stt, tts=tts) as ws:
+    async with running_call(
+        monkeypatch, seeded, client=FakeClient(*OFFER), stt=stt, tts=tts, barge_in=False
+    ) as ws:
         await ws.wait_for("listening")
         ws.feed(tone(700) + silence(1200))
         await ws.wait_for("transcript")
@@ -457,20 +326,6 @@ async def test_a_model_that_says_nothing_gets_a_spoken_fallback(monkeypatch, see
 # ---------------------------------------------------------------------------
 # Handing over
 # ---------------------------------------------------------------------------
-
-HANDOFF = [
-    [
-        tool(
-            0,
-            id="h1",
-            name="handoff_to_human",
-            args='{"reason": "caller_asked_for_human", "summary": "Wants to speak to a person."}',
-        ),
-        finish("tool_calls"),
-    ],
-    [text("Of course, I am putting you through now."), finish("stop")],
-]
-
 
 async def test_a_handoff_ends_the_call_and_records_why(monkeypatch, sessionmaker_for, seeded):
     async with running_call(
@@ -548,3 +403,102 @@ async def test_a_booking_made_by_voice_lands_in_the_bookings_table(
     assert rows[0].customer_name == "Asha Menon"
     assert rows[0].source.value == "voice"
     assert rows[0].customer_phone_e164 == "+919876543210"
+
+
+# ---------------------------------------------------------------------------
+# Filling the silence while a tool runs
+# ---------------------------------------------------------------------------
+
+LOOKUP = '{"service": "Dental cleaning", "when": "next tuesday evening", "staff_name": null}'
+
+
+async def test_a_tool_turn_fills_the_silence_and_logs_the_stopgap_apart_from_the_answer(
+    monkeypatch, sessionmaker_for, seeded
+):
+    """The model asks for a tool without a word, so the line would be dead for the
+    seconds the lookup takes. A stopgap is said at once -- and timed separately,
+    because it makes a slow turn feel faster without making it faster."""
+    stt, tts = FakeSTT("I need a dental cleaning next Tuesday evening"), FakeTTS()
+    async with running_call(
+        monkeypatch, seeded, client=FakeClient(*OFFER), stt=stt, tts=tts, tool_filler=True
+    ) as ws:
+        await speak_turn(ws, turn=1)
+
+    # After the greeting, before the answer, in that order.
+    assert tts.spoken[:3] == [
+        "Test Clinic, how can I help?",
+        "One moment.",
+        "We have Tuesday at five o'clock.",
+    ]
+
+    _, turns = await stored_turns(sessionmaker_for, ws)
+    reply = turns[-1]
+    assert reply.filler_ms is not None
+    assert reply.filler_ms < reply.total_ms, "the answer arrived after the stopgap"
+    # The answer's own timings are still the answer's.
+    assert reply.total_ms == reply.tts_first_audio_ms
+    assert reply.llm_first_token_ms <= reply.total_ms  # equal when both services are instant
+    assert reply.text.startswith("One moment. We have Tuesday")
+    assert ws.of("turn_done")[0]["filler_ms"] == reply.filler_ms
+
+
+async def test_no_stopgap_is_said_when_the_model_already_spoke(monkeypatch, sessionmaker_for, seeded):
+    script = [
+        [text("Let me check that for you. "),
+         tool(0, id="c1", name="check_availability", args=LOOKUP), finish("tool_calls")],
+        [text("We have Tuesday at five o'clock. "), finish("stop")],
+    ]
+    stt, tts = FakeSTT("I need a dental cleaning next Tuesday evening"), FakeTTS()
+    async with running_call(
+        monkeypatch, seeded, client=FakeClient(*script), stt=stt, tts=tts, tool_filler=True
+    ) as ws:
+        await speak_turn(ws, turn=1)
+
+    assert "One moment." not in tts.spoken
+    _, turns = await stored_turns(sessionmaker_for, ws)
+    assert turns[-1].filler_ms is None
+    assert turns[-1].total_ms == turns[-1].tts_first_audio_ms
+
+
+async def test_no_stopgap_is_said_before_a_handoff(monkeypatch, sessionmaker_for, seeded):
+    """Handing over has the model's own words; "one moment" ahead of them would
+    be a second goodbye."""
+    stt, tts = FakeSTT("can I speak to a real person"), FakeTTS()
+    async with running_call(
+        monkeypatch, seeded, client=FakeClient(*HANDOFF), stt=stt, tts=tts,
+        tool_filler=True, hang_up=False,
+    ) as ws:
+        await ws.wait_for("listening")
+        ws.feed(tone(700) + silence(1200))
+        await ws.wait_for("handoff")
+
+    assert not [line for line in tts.spoken if line in {"One moment.", "Let me check that.", "Sure, one moment."}]
+
+
+async def test_the_stopgap_can_be_switched_off(monkeypatch, sessionmaker_for, seeded):
+    stt, tts = FakeSTT("I need a dental cleaning next Tuesday evening"), FakeTTS()
+    async with running_call(
+        monkeypatch, seeded, client=FakeClient(*OFFER), stt=stt, tts=tts, tool_filler=False
+    ) as ws:
+        await speak_turn(ws, turn=1)
+
+    assert "One moment." not in tts.spoken
+    _, turns = await stored_turns(sessionmaker_for, ws)
+    assert turns[-1].filler_ms is None
+
+
+async def test_the_stopgaps_vary_so_a_long_call_does_not_sound_like_a_recording(monkeypatch, seeded):
+    again = [
+        [tool(0, id="c2", name="check_availability", args=LOOKUP), finish("tool_calls")],
+        [text("Wednesday is free too. "), finish("stop")],
+    ]
+    stt, tts = FakeSTT("tuesday evening", "what about wednesday"), FakeTTS()
+    async with running_call(
+        monkeypatch, seeded, client=FakeClient(*OFFER, *again), stt=stt, tts=tts, tool_filler=True
+    ) as ws:
+        await speak_turn(ws, turn=1)
+        await speak_turn(ws, turn=2)
+
+    said = [line for line in tts.spoken if line in {"One moment.", "Let me check that.", "Sure, one moment."}]
+    assert said == ["One moment.", "Let me check that."]
+

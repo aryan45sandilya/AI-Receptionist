@@ -7,6 +7,11 @@ database, so the latency columns can be checked against what actually happened.
 
     python -m scripts.voice_client scratch/speech/01_booking.wav scratch/speech/02_confirm.wav
 
+To interrupt the agent instead of waiting for it to finish, add --talk-over: each
+file after the first starts playing a second into the agent's reply.
+
+    python -m scripts.voice_client --talk-over scratch/speech/01_booking.wav scratch/speech/02_confirm.wav
+
 Audio is sent at real-time speed on purpose. The server's timing is measured from
 when the caller stops talking, and a client that blasted the file over instantly
 would make every latency figure meaningless.
@@ -56,7 +61,7 @@ async def stream(ws, pcm: bytes) -> None:
         await asyncio.sleep(max(0.0, due - time.perf_counter()))
 
 
-async def run(host: str, files: list[Path], timeout: float) -> None:
+async def run(host: str, files: list[Path], timeout: float, talk_over: float | None = None) -> None:
     t0 = time.perf_counter()
     audio_bytes = 0
     call_id: str | None = None
@@ -66,6 +71,7 @@ async def run(host: str, files: list[Path], timeout: float) -> None:
 
     async with websockets.connect(f"ws://{host}/ws/voice", max_size=None) as ws:
         listening = asyncio.Event()
+        speaking = asyncio.Event()
         finished = asyncio.Event()
         turn_events: list[dict] = []
 
@@ -87,6 +93,10 @@ async def run(host: str, files: list[Path], timeout: float) -> None:
                     call_id = event["call_id"]
                 if kind == "turn_done":
                     turn_events.append(event)
+                if kind == "audio_start":
+                    speaking.set()
+                if kind in {"clear", "audio_end"}:
+                    speaking.clear()
                 if kind == "listening":
                     listening.set()
                 if kind in {"fatal", "turn_error"}:
@@ -100,12 +110,21 @@ async def run(host: str, files: list[Path], timeout: float) -> None:
             for index, path in enumerate(files, start=1):
                 if finished.is_set():
                     break
-                # The greeting plays first, and a turn is only heard once the
-                # server says it is listening again.
-                await asyncio.wait_for(listening.wait(), timeout)
+                if talk_over is not None and index > 1:
+                    # Cut in: wait until the agent is mid-reply, then talk.
+                    await asyncio.wait_for(speaking.wait(), timeout)
+                    await asyncio.sleep(talk_over)
+                    print(f"\n  {stamp()}  >>> caller talks over the agent: {path.name}")
+                else:
+                    # The greeting plays first, and a turn is only heard once the
+                    # server says it is listening again.
+                    await asyncio.wait_for(listening.wait(), timeout)
+                    print(f"\n  {stamp()}  >>> caller turn {index}: {path.name}")
                 listening.clear()
-                print(f"\n  {stamp()}  >>> caller turn {index}: {path.name}")
                 await stream(ws, load(path))
+                if talk_over is not None and index < len(files):
+                    # Do not wait for the reply: the next file is meant to cut in on it.
+                    continue
                 # Wait for this turn's reply to finish, or the call to end.
                 await asyncio.wait_for(_first_of(listening, finished), timeout)
             await asyncio.sleep(0.5)
@@ -153,7 +172,7 @@ async def show_call(call_id: str | None) -> None:
             f"    {t.turn_index:>2} {t.role.value:<7}"
             f"{cell(t.stt_final_ms, 6)}{cell(t.llm_first_token_ms, 8)}"
             f"{cell(t.llm_done_ms, 8)}{cell(t.tts_first_audio_ms, 8)}{cell(t.total_ms, 7)}"
-            f"  {(t.text or '')[:70]}"
+            f"  {'[cut off] ' if t.barge_in else ''}{(t.text or '')[:60]}"
         )
 
 
@@ -162,6 +181,11 @@ def main() -> None:
     parser.add_argument("files", nargs="+", type=Path, help="16 kHz mono WAV files, one per caller turn")
     parser.add_argument("--host", default="127.0.0.1:8000")
     parser.add_argument("--timeout", type=float, default=60.0, help="seconds to wait per turn")
+    parser.add_argument(
+        "--talk-over", nargs="?", type=float, const=1.0, default=None, metavar="SECONDS",
+        help="start each file after the first this long into the agent's reply, "
+             "instead of waiting for it to finish (default 1.0)",
+    )
     args = parser.parse_args()
 
     missing = [f for f in args.files if not f.exists()]
@@ -170,7 +194,7 @@ def main() -> None:
 
     async def go() -> None:
         try:
-            await run(args.host, args.files, args.timeout)
+            await run(args.host, args.files, args.timeout, args.talk_over)
         finally:
             await dispose_engine()
 

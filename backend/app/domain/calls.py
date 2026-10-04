@@ -59,6 +59,7 @@ async def log_turn(
     llm_done_ms: int | None = None,
     tts_first_audio_ms: int | None = None,
     total_ms: int | None = None,
+    filler_ms: int | None = None,
     barge_in: bool = False,
     tool_calls: list[dict[str, Any]] | None = None,
     model: str | None = None,
@@ -83,6 +84,7 @@ async def log_turn(
         llm_done_ms=llm_done_ms,
         tts_first_audio_ms=tts_first_audio_ms,
         total_ms=total_ms,
+        filler_ms=filler_ms,
         barge_in=barge_in,
         # A JSONB column, so the list is wrapped in an object -- top-level arrays
         # are awkward to query with the -> operators.

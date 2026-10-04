@@ -8,6 +8,7 @@ failure mode of the quiet version is writing test bookings into production.
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -40,6 +41,19 @@ def uses_transaction_pooling(url: str) -> bool:
     if port == _TRANSACTION_POOL_PORT:
         return True
     return _NEON_POOLER_MARKER in host and host.endswith("neon.tech")
+
+
+def _resolve_provider(choice: str, deepgram_key: str) -> Literal["deepgram", "groq"]:
+    """Turn "auto" into a concrete service.
+
+    Asking for Deepgram without a key is not quietly downgraded to Groq: someone
+    who named a provider wants that provider, and finding out from a log line
+    that they got the other one is how a comparison goes wrong. The call fails to
+    start with a message saying which key is missing.
+    """
+    if choice == "auto":
+        return "deepgram" if deepgram_key.strip() else "groq"
+    return choice  # type: ignore[return-value]  # validated by the Literal
 
 
 class Settings(BaseSettings):
@@ -92,19 +106,85 @@ class Settings(BaseSettings):
     # Groq's Orpheus voices: autumn, diana, hannah, austin, daniel, troy.
     tts_voice: str = "hannah"
 
+    # --- Which speech service ---------------------------------------------------
+    # "auto" picks Deepgram when a key is set and Groq otherwise, so a fresh clone
+    # with only a free Groq key still has a working voice. Name one explicitly to
+    # force it -- useful for comparing the two on the same call.
+    stt_provider: Literal["auto", "deepgram", "groq"] = "auto"
+    tts_provider: Literal["auto", "deepgram", "groq"] = "auto"
+
+    # Deepgram: streaming transcription and streaming speech over WebSockets.
+    # Free signup credit, no card: https://console.deepgram.com
+    deepgram_api_key: str = ""
+    deepgram_stt_model: str = "nova-3"
+    # How much silence Deepgram waits for before it calls the utterance finished.
+    # Shorter answers sooner but cuts off a caller who pauses mid-sentence. The
+    # time from the caller stopping to the transcript being ready is this plus the
+    # network round trip (~300 ms from India), so every 100 ms here is 100 ms
+    # off every reply. A split is cheap to repair -- see "a pause that was not the
+    # end" in voice/call.py -- which is what makes a short value affordable.
+    deepgram_endpointing_ms: int = 400
+    # Aura-2 voice. Chosen from the catalogue for being described as warm,
+    # approachable and polite; `python -m scripts.list_voices` lists the others.
+    deepgram_tts_model: str = "aura-2-cordelia-en"
+
+    # --- Hearing the end of an utterance --------------------------------------------
+    # How much silence the detector waits for before it closes an utterance. This
+    # is the only end-of-speech clock when the transcriber is a batch service.
+    vad_end_silence_ms: int = 800
+    # When the transcription service ends utterances itself, the detector's timer
+    # is only a backstop for the service never answering (noise that keeps it
+    # open, a dropped socket). It has to be well beyond the service's own wait or
+    # it wins the race, and every turn then pays a flush round trip for nothing.
+    vad_backstop_ms: int = 1500
+
+    # --- Filling the silence --------------------------------------------------------
+    # The model asks for a tool without writing a word, so while it runs (a few
+    # seconds: a model round trip, a database read, a second round trip) the line
+    # is dead. With this on, the agent says a short stopgap the moment it sees the
+    # request. It is a few words of speech, and it is timed separately so it cannot
+    # flatter the latency of the answer.
+    tool_filler: bool = True
+
+    # --- Barge-in -----------------------------------------------------------------
+    # The caller can talk over the agent and the agent stops. Turn it off to get
+    # the half-duplex behaviour of Phase 2 (the agent ignores the mic while it
+    # speaks) -- the right setting if a laptop's speakers are feeding the agent's
+    # own voice back into its microphone and it keeps interrupting itself.
+    barge_in: bool = True
+    # How long the caller must keep talking before it counts as an interruption.
+    # Long enough that a cough, a "mm-hm" or a click of the speakers does not cut
+    # the agent off; short enough that a real "wait, no" lands within a syllable
+    # or two.
+    barge_in_ms: int = 300
+
+    # --- Telephony ----------------------------------------------------------------
+    # The address Twilio reaches this server on, e.g. https://abc.trycloudflare.com
+    # Used to check webhook signatures (they are computed over the exact URL
+    # Twilio called) and to tell Twilio where to open the audio stream.
+    public_base_url: str = ""
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+    twilio_phone_number: str = ""
+
     # --- Booking policy -----------------------------------------------------
     slot_granularity_min: int = 15
     min_lead_min: int = 30
     max_slots_offered: int = 3
 
-    # --- Phase 2+ (declared so .env validates; unused in Phase 1) -----------
-    deepgram_api_key: str = ""
+    # --- Later phases (declared so .env validates) --------------------------
     cartesia_api_key: str = ""
-    twilio_account_sid: str = ""
-    twilio_auth_token: str = ""
     whatsapp_token: str = ""
     whatsapp_phone_number_id: str = ""
     redis_url: str = "redis://localhost:6379/0"
+
+    @property
+    def stt_service(self) -> Literal["deepgram", "groq"]:
+        return _resolve_provider(self.stt_provider, self.deepgram_api_key)
+
+    @property
+    def tts_service(self) -> Literal["deepgram", "groq"]:
+        return _resolve_provider(self.tts_provider, self.deepgram_api_key)
 
     @property
     def db_connect_args(self) -> dict[str, object]:

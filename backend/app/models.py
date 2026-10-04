@@ -262,14 +262,20 @@ class CallTurn(Base):
     stt_final_ms: Mapped[int | None] = mapped_column(Integer)
     llm_first_token_ms: Mapped[int | None] = mapped_column(Integer)
     llm_done_ms: Mapped[int | None] = mapped_column(Integer)
+    # When the *answer* first reached the caller's ears: the model's own words,
+    # not the stopgap (see filler_ms). NULL if they never did.
     tts_first_audio_ms: Mapped[int | None] = mapped_column(Integer)
-    # What the caller waited. On a voice channel that is anchor -> first audio
-    # they hear: the only latency number that reflects what the call felt like,
-    # and NULL when nothing was ever heard (a turn whose voice failed had no
-    # response time, not a small one). On a text channel there is no audio, so it
-    # is anchor -> reply complete. The two are not comparable: filter by
-    # calls.channel before taking percentiles.
+    # What the caller waited for. On a voice channel that is anchor -> first audio
+    # of the answer they hear, NULL when nothing was ever heard (a turn whose voice
+    # failed had no response time, not a small one). On a text channel there is no
+    # audio, so it is anchor -> reply complete. The two are not comparable: filter
+    # by calls.channel before taking percentiles.
     total_ms: Mapped[int | None] = mapped_column(Integer)
+    # When the line stopped being silent, if that was a stopgap ("one moment")
+    # said while a tool ran, before the answer was ready. Kept apart so it cannot
+    # flatter total_ms: a filler makes a slow turn feel faster, not be faster.
+    # NULL when the first thing the caller heard was the answer.
+    filler_ms: Mapped[int | None] = mapped_column(Integer)
 
     barge_in: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Tool name, arguments, result and duration. JSONB rather than a table per

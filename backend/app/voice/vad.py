@@ -23,8 +23,10 @@ import math
 from dataclasses import dataclass, field
 from enum import Enum
 
-# 16 kHz mono 16-bit PCM throughout: what the transcription model wants, and
-# small enough to stream comfortably over a WebSocket.
+# 16 kHz mono 16-bit PCM is the default: what the browser sends, and small enough
+# to stream comfortably over a WebSocket. A telephone call arrives at 8 kHz, and
+# the detector is told so with ``sample_rate``; nothing in it depends on the rate
+# except how many bytes make a frame.
 SAMPLE_RATE = 16_000
 SAMPLE_WIDTH = 2
 
@@ -97,15 +99,53 @@ class VoiceActivityDetector:
     """
 
     config: VadConfig = field(default_factory=VadConfig)
+    sample_rate: int = SAMPLE_RATE
 
     _buffer: bytearray = field(default_factory=bytearray, init=False)
     _speech: bytearray = field(default_factory=bytearray, init=False)
     _preroll: list[bytes] = field(default_factory=list, init=False)
     _loud_run: int = field(default=0, init=False)
     _quiet_run: int = field(default=0, init=False)
+    _speech_frames: int = field(default=0, init=False)
     _in_speech: bool = field(default=False, init=False)
     _noise_floor: float | None = field(default=None, init=False)
     _endpoint_silence_ms: int = field(default=0, init=False)
+    _frame_bytes: int = field(default=FRAME_BYTES, init=False)
+
+    def __post_init__(self) -> None:
+        self._frame_bytes = self.sample_rate * FRAME_MS // 1000 * SAMPLE_WIDTH
+
+    @property
+    def speech_ms(self) -> int:
+        """How long the current utterance has been going, counted from the frame
+        that first sounded like speech. Zero between utterances.
+
+        What barge-in measures: the caller has not interrupted until they have
+        kept talking for a while, and "a while" is this."""
+        return self._speech_frames * FRAME_MS if self._in_speech else 0
+
+    @property
+    def voiced_ms(self) -> int:
+        """How long the caller has actually been *talking* in this utterance: from
+        the first frame that sounded like speech to the last one that did.
+
+        Not ``speech_ms``, which keeps counting through the silence that follows
+        until the utterance is closed. A cough is 120 ms of sound and then 800 ms
+        of nothing; ``speech_ms`` would read 920 and call it an interruption. This
+        reads 120, and stays there."""
+        if not self._in_speech:
+            return 0
+        return max(0, self._speech_frames - self._quiet_run) * FRAME_MS
+
+    @property
+    def quiet_ms(self) -> int:
+        """Silence since the last loud frame, while an utterance is open.
+
+        The moment the caller actually stopped talking is this far in the past.
+        A transcription service that decides the utterance is over before this
+        detector does (it listens for a shorter pause) still needs the answer, to
+        anchor the latency clock where the caller's waiting began."""
+        return self._quiet_run * FRAME_MS if self._in_speech else 0
 
     @property
     def endpoint_silence_ms(self) -> int:
@@ -173,9 +213,9 @@ class VoiceActivityDetector:
         self._buffer.extend(pcm)
         events: list[tuple[Event, bytes | None]] = []
 
-        while len(self._buffer) >= FRAME_BYTES:
-            frame = bytes(self._buffer[:FRAME_BYTES])
-            del self._buffer[:FRAME_BYTES]
+        while len(self._buffer) >= self._frame_bytes:
+            frame = bytes(self._buffer[: self._frame_bytes])
+            del self._buffer[: self._frame_bytes]
             event = self._consume_frame(frame)
             if event is not None:
                 events.append(event)
@@ -198,12 +238,15 @@ class VoiceActivityDetector:
             if self._loud_run >= self.config.start_frames:
                 self._in_speech = True
                 self._quiet_run = 0
+                # The frames that tripped the threshold count towards the length.
+                self._speech_frames = self._loud_run
                 self._speech = bytearray(b"".join(self._preroll))
                 self._preroll.clear()
                 return (Event.SPEECH_STARTED, None)
             return None
 
         self._speech.extend(frame)
+        self._speech_frames += 1
         self._quiet_run = 0 if loud else self._quiet_run + 1
 
         if len(self._speech) >= self._max_bytes():
@@ -213,20 +256,21 @@ class VoiceActivityDetector:
         return None
 
     def _max_bytes(self) -> int:
-        return self.config.max_utterance_ms * SAMPLE_RATE * SAMPLE_WIDTH // 1000
+        return self.config.max_utterance_ms * self.sample_rate * SAMPLE_WIDTH // 1000
 
     def _min_bytes(self) -> int:
-        return self.config.min_utterance_ms * SAMPLE_RATE * SAMPLE_WIDTH // 1000
+        return self.config.min_utterance_ms * self.sample_rate * SAMPLE_WIDTH // 1000
 
     def _close_utterance(self) -> tuple[Event, bytes | None]:
         # Drop the trailing silence that ended the utterance; there is no point
         # paying to transcribe it, and it adds latency.
-        tail = self._quiet_run * FRAME_BYTES
+        tail = self._quiet_run * self._frame_bytes
         self._endpoint_silence_ms = self._quiet_run * FRAME_MS
         audio = bytes(self._speech[: len(self._speech) - tail] if tail else self._speech)
 
         self._in_speech = False
         self._speech = bytearray()
+        self._speech_frames = 0
         self._loud_run = 0
         self._quiet_run = 0
 
@@ -250,4 +294,5 @@ class VoiceActivityDetector:
         self._preroll.clear()
         self._loud_run = 0
         self._quiet_run = 0
+        self._speech_frames = 0
         self._in_speech = False

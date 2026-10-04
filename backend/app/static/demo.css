@@ -44,6 +44,9 @@ main { padding: 1.25rem; max-width: 72rem; margin: 0 auto; }
 
 .muted { color: var(--ink); opacity: 0.75; margin: 0; }
 .small { font-size: var(--step--1); margin-bottom: 0.75rem; }
+.headphones { margin: 0.75rem 0 0; }
+.toggle { display: inline-flex; align-items: center; gap: 0.5rem; font-weight: 700; }
+.toggle input { width: 1.1rem; height: 1.1rem; accent-color: var(--ink); }
 
 .controls {
   display: flex;
@@ -102,6 +105,9 @@ button:disabled {
 .ruled .who { display: block; font-size: var(--step--1); font-weight: 700; }
 .ruled li.agent .who { color: var(--ok); }
 .ruled li.system { color: var(--fail); }
+/* Words still being heard: not final yet, so not at full strength. */
+.ruled li.heard { opacity: 0.6; }
+.ruled li.note { font-size: var(--step--1); opacity: 0.7; font-style: italic; }
 .empty { opacity: 0.7; }
 
 .table-wrap { overflow-x: auto; }
