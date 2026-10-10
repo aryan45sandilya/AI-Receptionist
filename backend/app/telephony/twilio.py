@@ -65,6 +65,26 @@ def valid_signature(
     return hmac.compare_digest(expected.encode(), header.encode())
 
 
+# A call that is still going on. A webhook about a finished call is a replay.
+LIVE_CALL_STATES = frozenset({"queued", "ringing", "in-progress"})
+
+
+def call_matches(record: Mapping[str, Any], form: Mapping[str, str]) -> bool:
+    """Whether Twilio's own record of a call agrees with what a webhook says about it.
+
+    The way to trust a webhook that carries no signature: ask Twilio, with the
+    account's credentials, whether this call exists on this account and is still
+    live, and compare who is on it and which way it is going.
+    """
+    return (
+        record.get("sid") == form.get("CallSid")
+        and record.get("status") in LIVE_CALL_STATES
+        and record.get("direction") == form.get("Direction")
+        and record.get("from") == form.get("From")
+        and record.get("to") == form.get("To")
+    )
+
+
 # ---------------------------------------------------------------------------
 # The stream token
 # ---------------------------------------------------------------------------
@@ -186,12 +206,24 @@ class TwilioRest:
 
         The same webhook an incoming call uses, so an outbound test call goes
         through exactly the path a real one does.
+
+        Only To, From and Url are sent. Twilio's trial accounts reject any other
+        parameter ("trial accounts have limited parameter access"), and that
+        includes ``Method``, which would only have restated its default of POST.
         """
         response = await self._client.post(
             f"{self._calls}.json",
             auth=self._auth,
-            data={"To": to, "From": from_, "Url": url, "Method": "POST"},
+            data={"To": to, "From": from_, "Url": url},
         )
+        _check(response)
+        return response.json()
+
+    async def fetch_call(self, call_sid: str) -> dict[str, Any] | None:
+        """Twilio's own record of a call on this account, or None if it has none."""
+        response = await self._client.get(f"{self._calls}/{call_sid}.json", auth=self._auth)
+        if response.status_code == 404:
+            return None
         _check(response)
         return response.json()
 

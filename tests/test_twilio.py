@@ -202,9 +202,10 @@ async def test_a_test_call_is_placed_through_the_same_webhook_a_real_one_uses():
     assert request.method == "POST"
     assert str(request.url) == "https://api.twilio.com/2010-04-01/Accounts/AC123/Calls.json"
     assert request.headers["authorization"] == "Basic " + base64.b64encode(f"AC123:{AUTH}".encode()).decode()
+    # Exactly these three: a trial account rejects any other parameter, Method included.
     assert dict(parse_qsl(request.content.decode())) == {
         "To": "+919876543210", "From": "+15005550006",
-        "Url": "https://x.test/twilio/voice", "Method": "POST",
+        "Url": "https://x.test/twilio/voice",
     }
     assert result["sid"] == "CA999"
 
@@ -242,6 +243,8 @@ def settings(**overrides) -> Settings:
 
 @pytest.fixture
 def client(monkeypatch):
+    twilio_api._unsigned_checks.clear()  # the per-minute budget is module state
+
     def make(**overrides) -> TestClient:
         monkeypatch.setattr(twilio_api, "get_settings", lambda: settings(**overrides))
         app = FastAPI()
@@ -304,6 +307,111 @@ def test_a_webhook_with_a_changed_field_is_refused(client):
     headers = signed("https://example.test/twilio/voice", INBOUND)
     forged = {**INBOUND, "From": "+910000000000"}
     assert http.post("/twilio/voice", data=forged, headers=headers).status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# A webhook with no signature. A real call on a trial account sent exactly this:
+# a genuine request -- its CallSid was a real call on the account, and Twilio's
+# own record agreed with it -- but with no X-Twilio-Signature header at all. So
+# the call is confirmed with Twilio's API instead, and a forgery still fails.
+# ---------------------------------------------------------------------------
+
+UNSIGNED_ACCOUNT = "AC" + "f" * 32
+UNSIGNED_CALL_SID = "CA" + "0123456789abcdef" * 2
+UNSIGNED = {
+    "AccountSid": UNSIGNED_ACCOUNT, "ApiVersion": "2010-04-01", "CallSid": UNSIGNED_CALL_SID, "CallStatus": "in-progress",
+    "Direction": "outbound-api", "From": "+15005550006", "To": "+919876543210",
+}
+RECORD = {"sid": UNSIGNED_CALL_SID, "status": "in-progress", "direction": "outbound-api",
+          "from": "+15005550006", "to": "+919876543210"}
+
+
+def twilio_says(monkeypatch, record=RECORD, status=200):
+    """Stand in for Twilio's API; returns the requests the server makes to it."""
+    def respond(request):
+        if record is None:
+            return httpx.Response(404, json={"message": "not found"})
+        return httpx.Response(status, json=record)
+
+    rest, seen = rest_with(respond)
+    monkeypatch.setattr(twilio_api, "TwilioRest", lambda sid, token: rest)
+    return seen
+
+
+def post_unsigned(http, form=UNSIGNED):
+    return http.post("/twilio/voice", data=form)
+
+
+def test_an_unsigned_webhook_is_answered_when_twilio_confirms_the_call(client, monkeypatch):
+    seen = twilio_says(monkeypatch)
+    response = post_unsigned(client(twilio_account_sid=UNSIGNED_ACCOUNT))
+    assert response.status_code == 200
+    params = {p.get("name"): p.get("value") for p in ET.fromstring(response.text).findall(".//Parameter")}
+    # Same rule as a signed one: for a call Twilio placed, the caller is the person rung.
+    assert (params["caller"], params["dialed"]) == ("+919876543210", "+15005550006")
+    assert [r.method for r in seen] == ["GET"]
+    assert str(seen[0].url).endswith(f"/Calls/{UNSIGNED_CALL_SID}.json")
+
+
+def test_an_unsigned_webhook_for_a_call_twilio_has_no_record_of_is_refused(client, monkeypatch):
+    twilio_says(monkeypatch, record=None)
+    assert post_unsigned(client(twilio_account_sid=UNSIGNED_ACCOUNT)).status_code == 403
+
+
+def test_an_unsigned_webhook_that_disagrees_with_twilios_record_is_refused(client, monkeypatch):
+    """Someone who knew a call's id still cannot change who it is between."""
+    twilio_says(monkeypatch)
+    forged = {**UNSIGNED, "To": "+910000000000"}
+    assert post_unsigned(client(twilio_account_sid=UNSIGNED_ACCOUNT), forged).status_code == 403
+
+
+def test_an_unsigned_webhook_about_a_finished_call_is_refused(client, monkeypatch):
+    """A replay of an old request must not start a new conversation."""
+    twilio_says(monkeypatch, record={**RECORD, "status": "completed"})
+    assert post_unsigned(client(twilio_account_sid=UNSIGNED_ACCOUNT)).status_code == 403
+
+
+def test_an_unsigned_webhook_is_refused_when_twilio_cannot_be_asked(client, monkeypatch):
+    twilio_says(monkeypatch, status=500)
+    assert post_unsigned(client(twilio_account_sid=UNSIGNED_ACCOUNT)).status_code == 403
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        {**UNSIGNED, "AccountSid": "AC" + "0" * 32},   # someone else's account
+        {**UNSIGNED, "CallSid": "CA777"},                # not shaped like a call id
+        {k: v for k, v in UNSIGNED.items() if k != "CallSid"},
+    ],
+    ids=["another-account", "malformed-call-id", "no-call-id"],
+)
+def test_an_unsigned_webhook_that_cannot_be_ours_never_reaches_twilios_api(client, monkeypatch, form):
+    seen = twilio_says(monkeypatch)
+    assert post_unsigned(client(twilio_account_sid=UNSIGNED_ACCOUNT), form).status_code == 403
+    assert seen == []
+
+
+def test_a_bad_signature_is_never_rescued_by_twilios_record(client, monkeypatch):
+    """Only the absence of a signature falls back. A wrong one is a forgery."""
+    seen = twilio_says(monkeypatch)
+    headers = signed("https://example.test/twilio/voice", UNSIGNED, token="someone-elses")
+    response = client(twilio_account_sid=UNSIGNED_ACCOUNT).post("/twilio/voice", data=UNSIGNED, headers=headers)
+    assert response.status_code == 403
+    assert seen == []
+
+
+def test_an_unsigned_webhook_is_refused_when_no_account_is_configured(client, monkeypatch):
+    seen = twilio_says(monkeypatch)
+    assert post_unsigned(client(twilio_account_sid="")).status_code == 403
+    assert seen == []
+
+
+def test_a_flood_of_unsigned_webhooks_does_not_become_a_flood_of_calls_to_twilio(client, monkeypatch):
+    seen = twilio_says(monkeypatch, record=None)
+    http = client(twilio_account_sid=UNSIGNED_ACCOUNT)
+    for _ in range(twilio_api.UNSIGNED_CHECKS_PER_MINUTE + 5):
+        assert post_unsigned(http).status_code == 403
+    assert len(seen) == twilio_api.UNSIGNED_CHECKS_PER_MINUTE
 
 
 def test_nothing_is_answered_until_the_auth_token_is_configured(client):

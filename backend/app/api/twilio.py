@@ -6,15 +6,19 @@ what to do; the answer is TwiML telling it to open a WebSocket to
 conversation the browser demo has -- see ``voice/call.py``.
 
 Both doors are closed by default. The webhook is public, so it answers only a
-request that carries a valid Twilio signature, and the stream starts only for a
-caller holding the token the webhook minted. Neither opens at all until
-``TWILIO_AUTH_TOKEN`` is set.
+request that carries a valid Twilio signature -- or, for the unsigned requests a
+trial account's calls turned out to send, one whose call Twilio's own API
+confirms -- and the stream starts only for a caller holding the token the webhook
+minted. Neither opens at all until ``TWILIO_AUTH_TOKEN`` is set.
 """
 
 from __future__ import annotations
 
 import contextlib
 import logging
+import re
+import time
+from collections import deque
 from urllib.parse import parse_qsl
 
 from fastapi import APIRouter, Request, Response, WebSocket
@@ -23,6 +27,7 @@ from ..config import Settings, get_settings
 from ..enums import CallChannel
 from ..telephony.twilio import (
     TwilioRest,
+    call_matches,
     connect_twiml,
     say_twiml,
     valid_signature,
@@ -75,6 +80,68 @@ def _parties(form: dict[str, str]) -> tuple[str, str]:
     return form.get("From", ""), form.get("To", "")
 
 
+CALL_SID = re.compile(r"CA[0-9a-fA-F]{32}")
+# Each unsigned request costs a call to Twilio's API, so a flood of forged ones must
+# not become a flood of those: past this many a minute, they are refused unasked.
+UNSIGNED_CHECKS_PER_MINUTE = 20
+_unsigned_checks: deque[float] = deque()
+
+
+def _within_unsigned_budget() -> bool:
+    now = time.monotonic()
+    while _unsigned_checks and now - _unsigned_checks[0] > 60:
+        _unsigned_checks.popleft()
+    if len(_unsigned_checks) >= UNSIGNED_CHECKS_PER_MINUTE:
+        return False
+    _unsigned_checks.append(now)
+    return True
+
+
+async def _authentic(
+    request: Request, settings: Settings, token: str, url: str,
+    params: list[tuple[str, str]], form: dict[str, str],
+) -> bool:
+    """Whether this request really is Twilio telling us about one of our calls.
+
+    A request that carries a signature must carry a valid one: there is no
+    falling back from a bad signature. A request that carries none -- which is
+    what Twilio sent for a call on a trial account, checked against a real call
+    -- is accepted only if Twilio's own API confirms the call it names.
+    """
+    header = request.headers.get(SIGNATURE_HEADER)
+    if header:
+        if valid_signature(token, url, params, header):
+            return True
+        log.warning("rejected a Twilio webhook with a bad signature for %s", url)
+        return False
+
+    account = settings.twilio_account_sid.strip()
+    call_sid = form.get("CallSid", "")
+    # Cheap checks first, so nothing that cannot be ours reaches Twilio's API.
+    if not account or form.get("AccountSid") != account or not CALL_SID.fullmatch(call_sid):
+        log.warning("rejected an unsigned Twilio webhook that does not name a call on this account (%s)", url)
+        return False
+    if not _within_unsigned_budget():
+        log.warning("too many unsigned Twilio webhooks in a minute; refusing without asking Twilio")
+        return False
+
+    rest = TwilioRest(account, token)
+    try:
+        record = await rest.fetch_call(call_sid)
+    except Exception:  # noqa: BLE001 - failing closed is the point; the log has why
+        log.exception("could not ask Twilio about call %s; refusing the webhook", call_sid)
+        return False
+    finally:
+        with contextlib.suppress(Exception):
+            await rest.close()
+
+    if record is None or not call_matches(record, form):
+        log.warning("rejected an unsigned Twilio webhook: Twilio does not confirm call %s", call_sid)
+        return False
+    log.info("accepted an unsigned webhook for call %s after Twilio confirmed the call", call_sid)
+    return True
+
+
 @router.post("/voice")
 async def answer(request: Request) -> Response:
     settings = get_settings()
@@ -88,11 +155,10 @@ async def answer(request: Request) -> Response:
     base = public_base(request, settings)
     url = base + request.url.path + (f"?{request.url.query}" if request.url.query else "")
 
-    if not valid_signature(token, url, params, request.headers.get(SIGNATURE_HEADER)):
-        log.warning("rejected a Twilio webhook with a bad signature for %s", url)
+    form = dict(params)
+    if not await _authentic(request, settings, token, url, params, form):
         return Response("Forbidden", status_code=403)
 
-    form = dict(params)
     caller, dialed = _parties(form)
     call_sid = form.get("CallSid", "")
     minted = mint_stream_token(token, call_sid=call_sid, caller=caller, dialed=dialed)

@@ -1,0 +1,599 @@
+/*
+  Five colours, and nothing else. States are told apart by words, weight and
+  borders rather than by extra tints.
+
+    paper   page and panels
+    ink     text and primary actions
+    rule    ruled lines and quiet borders
+    booked  booked, live
+    failed  missed, failed, errors
+
+  `npm run check` fails if a stray colour, gradient, shadow or capitalised label
+  is added.
+*/
+
+:root {
+  --paper: #ffffff;
+  --ink: #1f3a5f;
+  --rule: #d9dee5;
+  --booked: #2e7d4f;
+  --failed: #b3261e;
+
+  --font: 'Atkinson Hyperlegible', system-ui, sans-serif;
+
+  /* Type scale: a 1.25 ratio from 16 px, with 14 px as the smallest size used. */
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-lg: 1.25rem;
+  --text-xl: 1.5625rem;
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font);
+  font-size: var(--text-base);
+  line-height: 1.5;
+}
+
+h1,
+h2,
+h3,
+p,
+dl,
+dd,
+ol {
+  margin: 0;
+}
+
+button,
+input {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 3px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.skip {
+  position: absolute;
+  left: var(--space-4);
+  top: -4rem;
+  padding: var(--space-2) var(--space-4);
+  background: var(--ink);
+  color: var(--paper);
+  font-weight: 700;
+  z-index: 10;
+}
+
+.skip:focus {
+  top: var(--space-2);
+}
+
+.sample-banner {
+  padding: var(--space-2) var(--space-5);
+  background: var(--ink);
+  color: var(--paper);
+  font-size: var(--text-sm);
+}
+
+/* ---- Buttons and fields ------------------------------------------------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2.75rem;
+  padding: 0 var(--space-4);
+  border: 2px solid var(--ink);
+  border-radius: 4px;
+  background: var(--ink);
+  color: var(--paper);
+  font-weight: 700;
+  text-decoration: none;
+  cursor: pointer;
+  /* The one bit of motion: a brief response to a press. */
+  transition: background-color 120ms, color 120ms;
+}
+
+.btn:hover {
+  background: var(--paper);
+  color: var(--ink);
+}
+
+.btn.secondary {
+  background: var(--paper);
+  color: var(--ink);
+}
+
+.btn.secondary:hover {
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.btn.danger {
+  background: var(--paper);
+  border-color: var(--failed);
+  color: var(--failed);
+}
+
+.btn.danger:hover,
+.btn.danger.filled {
+  background: var(--failed);
+  color: var(--paper);
+}
+
+.btn.danger.filled:hover {
+  background: var(--paper);
+  color: var(--failed);
+}
+
+.datefield input {
+  min-height: 2.75rem;
+  padding: 0 var(--space-3);
+  border: 2px solid var(--ink);
+  border-radius: 4px;
+  background: var(--paper);
+  color: var(--ink);
+  font-weight: 700;
+}
+
+/* ---- Top bar ------------------------------------------------------------ */
+
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3) var(--space-5);
+  padding: var(--space-3) var(--space-5);
+  border-bottom: 2px solid var(--ink);
+}
+
+.brand {
+  margin-right: auto;
+  font-size: var(--text-lg);
+}
+
+.datebar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.live {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 2.75rem;
+  margin: 0;
+  font-weight: 700;
+}
+
+button.live {
+  padding: 0 var(--space-4);
+  border: 2px solid var(--booked);
+  border-radius: 4px;
+  background: var(--paper);
+  cursor: pointer;
+}
+
+.live-off {
+  font-weight: 400;
+}
+
+.dot {
+  flex: none;
+  width: 0.75rem;
+  height: 0.75rem;
+  border-radius: 50%;
+  background: var(--booked);
+}
+
+.timer {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- Workspace: the day on the left, the selected call on the right ------ */
+
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(20rem, 27rem) minmax(0, 1fr);
+  align-items: start;
+}
+
+.list-col {
+  position: sticky;
+  top: 0;
+  max-height: 100dvh;
+  overflow-y: auto;
+  padding: var(--space-5) var(--space-4) var(--space-6);
+  border-right: 1px solid var(--rule);
+}
+
+.detail-col {
+  padding: var(--space-5) var(--space-6) 3rem;
+}
+
+.back {
+  display: none;
+  margin-bottom: var(--space-4);
+}
+
+.loading {
+  padding: var(--space-4) 0;
+}
+
+/* ---- The register ------------------------------------------------------- */
+
+.day-title {
+  font-size: var(--text-xl);
+  line-height: 1.25;
+}
+
+.tag {
+  display: inline-block;
+  margin-left: var(--space-3);
+  padding: 0 var(--space-2);
+  border: 2px solid var(--ink);
+  border-radius: 4px;
+  font-size: var(--text-sm);
+  vertical-align: middle;
+}
+
+.section-title {
+  margin: var(--space-5) 0 var(--space-2);
+  padding-bottom: var(--space-1);
+  border-bottom: 2px solid var(--ink);
+  font-size: var(--text-lg);
+  line-height: 1.25;
+}
+
+.register {
+  padding: 0;
+  list-style: none;
+}
+
+.register > li {
+  border-bottom: 1px solid var(--rule);
+}
+
+.entry {
+  display: grid;
+  grid-template-columns: 5.25rem minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 0 var(--space-3);
+  width: 100%;
+  padding: var(--space-3);
+  border: 2px solid transparent;
+  border-radius: 0;
+  background: var(--paper);
+  text-align: left;
+  cursor: pointer;
+}
+
+.entry[aria-current='true'] {
+  border-color: var(--ink);
+}
+
+.entry-time {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.entry-name {
+  display: block;
+  font-weight: 700;
+}
+
+.entry-detail {
+  display: block;
+  font-size: var(--text-sm);
+}
+
+/* A cancelled appointment is crossed out of the register, as on paper. */
+.struck .entry-time,
+.struck .entry-name {
+  text-decoration: line-through;
+}
+
+.status {
+  font-size: var(--text-sm);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.status-booked {
+  color: var(--booked);
+}
+
+.status-failed {
+  color: var(--failed);
+}
+
+/* ---- Notices (empty and error states) ----------------------------------- */
+
+.notice {
+  margin: var(--space-4) 0;
+  padding: var(--space-4);
+  border: 2px solid var(--ink);
+}
+
+.notice-failed {
+  border-color: var(--failed);
+}
+
+.notice-title {
+  font-size: var(--text-lg);
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.notice-failed .notice-title {
+  color: var(--failed);
+}
+
+.notice-body {
+  margin-top: var(--space-1);
+}
+
+.notice .btn {
+  margin-top: var(--space-3);
+}
+
+/* ---- Selected call ------------------------------------------------------ */
+
+.panel {
+  max-width: 48rem;
+}
+
+.panel-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-1) var(--space-4);
+}
+
+.panel-title {
+  font-size: var(--text-xl);
+  line-height: 1.25;
+}
+
+.panel-meta {
+  margin-top: var(--space-1);
+}
+
+.summary {
+  margin-top: var(--space-2);
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: var(--space-1) var(--space-5);
+  margin: var(--space-3) 0 var(--space-4);
+}
+
+.facts dt {
+  font-weight: 700;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+
+.confirm {
+  margin-top: var(--space-4);
+  padding: var(--space-4);
+  border: 2px solid var(--failed);
+}
+
+.confirm-question {
+  font-weight: 700;
+}
+
+.feedback {
+  margin-top: var(--space-3);
+  font-weight: 700;
+}
+
+.feedback:empty {
+  display: none;
+}
+
+/* ---- Transcript --------------------------------------------------------- */
+
+.transcript {
+  padding: 0;
+  list-style: none;
+}
+
+.turn {
+  margin-bottom: var(--space-3);
+  padding: var(--space-1) 0 var(--space-1) var(--space-3);
+  border-left: 3px solid var(--rule);
+}
+
+.turn-agent {
+  border-left-color: var(--ink);
+}
+
+.turn-who {
+  display: flex;
+  gap: var(--space-3);
+  font-size: var(--text-sm);
+  font-weight: 700;
+}
+
+.turn-time {
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+.turn-note {
+  font-size: var(--text-sm);
+  font-style: italic;
+}
+
+.turn-note-failed {
+  color: var(--failed);
+  font-style: normal;
+  font-weight: 700;
+}
+
+.turn-listening {
+  padding-left: var(--space-3);
+  font-style: italic;
+}
+
+/* ---- Reply speed -------------------------------------------------------- */
+
+.speed {
+  margin-top: var(--space-5);
+}
+
+.speed summary {
+  display: flex;
+  align-items: center;
+  min-height: 2.75rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.speed-note {
+  margin: var(--space-1) 0 var(--space-3);
+  font-size: var(--text-sm);
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+th,
+td {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--rule);
+  text-align: right;
+  white-space: nowrap;
+}
+
+th {
+  border-bottom: 2px solid var(--ink);
+  font-size: var(--text-sm);
+  vertical-align: bottom;
+  white-space: normal;
+}
+
+th:first-child,
+td:first-child {
+  text-align: left;
+}
+
+tbody th {
+  border-bottom: 1px solid var(--rule);
+  font-size: var(--text-base);
+  vertical-align: baseline;
+}
+
+td.none {
+  color: var(--failed);
+  font-weight: 700;
+}
+
+/* ---- Narrow screens: the list and the details take turns ---------------- */
+
+@media (max-width: 59.99rem) {
+  .topbar {
+    padding: var(--space-3) var(--space-4);
+  }
+
+  /* Each row of controls fills the width instead of leaving a stray button. */
+  .datebar,
+  .live-slot {
+    width: 100%;
+  }
+
+  .datebar > .btn {
+    flex: 1 1 auto;
+  }
+
+  button.live {
+    width: 100%;
+  }
+
+  .workspace {
+    display: block;
+  }
+
+  .list-col {
+    position: static;
+    max-height: none;
+    padding: var(--space-4) var(--space-4) var(--space-6);
+    border-right: 0;
+  }
+
+  .detail-col {
+    padding: var(--space-4) var(--space-4) var(--space-6);
+  }
+
+  .workspace[data-view='detail'] .list-col,
+  .workspace[data-view='list'] .detail-col {
+    display: none;
+  }
+
+  .back {
+    display: inline-flex;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
